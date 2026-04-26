@@ -1,0 +1,46 @@
+// Copyright (c) 2026 Peter Fors
+// SPDX-License-Identifier: MIT
+//
+// Windows resource script: VERSIONINFO + embedded application manifest.
+// Compiled with windres and linked into test_player.exe.
+
+#include <windows.h>
+
+#define VER_MAJOR  1
+#define VER_MINOR  0
+#define VER_PATCH  0
+#define VER_BUILD  0
+
+#define VER_STRING  "1.0.0.0"
+
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION     VER_MAJOR,VER_MINOR,VER_PATCH,VER_BUILD
+PRODUCTVERSION  VER_MAJOR,VER_MINOR,VER_PATCH,VER_BUILD
+FILEFLAGSMASK   0x3fL
+FILEFLAGS       0x0L
+FILEOS          VOS_NT_WINDOWS32
+FILETYPE        VFT_APP
+FILESUBTYPE     VFT2_UNKNOWN
+BEGIN
+	BLOCK "StringFileInfo"
+	BEGIN
+		BLOCK "040904b0"
+		BEGIN
+			VALUE "CompanyName",      "Mindkiller Systems"
+			VALUE "FileDescription",  "Test player for the Amiga Exotic Players collection"
+			VALUE "FileVersion",      VER_STRING
+			VALUE "InternalName",     "test_player"
+			VALUE "LegalCopyright",   "Copyright (c) 2026 Peter Fors. MIT License."
+			VALUE "OriginalFilename", "test_player.exe"
+			VALUE "ProductName",      "Amiga Exotic Players test_player"
+			VALUE "ProductVersion",   VER_STRING
+		END
+	END
+	BLOCK "VarFileInfo"
+	BEGIN
+		VALUE "Translation", 0x0409, 0x04b0
+	END
+END
+
+// Embedded application manifest. ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID for an EXE.
+1 RT_MANIFEST "test_player.manifest"

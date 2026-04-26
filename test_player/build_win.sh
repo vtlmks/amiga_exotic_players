@@ -5,27 +5,39 @@
 # Cross-compile test_player_win.c for Windows using mingw-w64.
 # Defaults to 64-bit; pass `32` as first arg for 32-bit.
 #
-# CRT-free build: -nostartfiles -nodefaultlibs avoids pulling in mingw's
-# UCRT-linked startup. We provide our own entry point (mainCRTStartup),
-# malloc/memset/sin/etc in the source, and link only against the Win32
-# import libs (kernel32, user32, winmm) plus libgcc for compiler helpers
-# like __chkstk_ms / __divdi3 / __udivdi3.
+# Links against msvcrt.dll (legacy C runtime, present in System32 on every
+# Windows since 95), kernel32, user32, and winmm. Standard C startup; no
+# installed runtime required.
 
 set -e
 
 ARCH="${1:-64}"
 case "$ARCH" in
-	64) CC=x86_64-w64-mingw32-gcc ;;
-	32) CC=i686-w64-mingw32-gcc ;;
+	64) CC=x86_64-w64-mingw32-gcc;       WINDRES=x86_64-w64-mingw32-windres ;;
+	32) CC=i686-w64-mingw32-gcc;         WINDRES=i686-w64-mingw32-windres ;;
 	*)  echo "usage: $0 [64|32]"; exit 1 ;;
 esac
 
 CFLAGS="-std=gnu99 -O2 -Wall -Wextra -Wno-unused-parameter -Wno-unused-function -Wno-unused-variable -fwrapv"
-# -ffreestanding tells gcc not to assume a hosted environment; safer for our
-# replacement-libc scheme. -fno-builtin prevents gcc from reasoning about
-# memcpy/memset semantics in a way that calls back into them recursively.
-CFLAGS="$CFLAGS -ffreestanding -fno-builtin"
-LDFLAGS="-nostartfiles -nodefaultlibs -Wl,--entry,mainCRTStartup -lgcc -lkernel32 -luser32 -lwinmm"
 
-$CC $CFLAGS test_player_win.c -o test_player.exe $LDFLAGS
+# Force linkage against legacy msvcrt.dll (in System32 since Win95/NT4) rather
+# than UCRT (api-ms-win-crt-*.dll). UCRT requires KB2999226 on Win7 and ships
+# only with Win10+; msvcrt.dll has been a system DLL on every Windows for 30
+# years.
+CFLAGS="$CFLAGS -mcrtdll=msvcrt-os"
+
+# DLLCHARACTERISTICS bits (ASLR / DEP / NX). Their absence contributes to AV
+# heuristic scoring; setting them costs nothing.
+LDFLAGS_HARDENING="-Wl,--nxcompat -Wl,--dynamicbase"
+if [ "$ARCH" = "64" ]; then
+	LDFLAGS_HARDENING="$LDFLAGS_HARDENING -Wl,--high-entropy-va"
+fi
+
+LDFLAGS="$LDFLAGS_HARDENING -lwinmm"
+
+# Compile the resource (VERSIONINFO + embedded application manifest).
+$WINDRES test_player.rc -O coff -o test_player.res.o
+
+$CC $CFLAGS test_player_win.c test_player.res.o -o test_player.exe $LDFLAGS
+rm -f test_player.res.o
 echo "built: test_player.exe ($ARCH-bit)"
