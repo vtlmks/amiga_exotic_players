@@ -122,6 +122,11 @@ cross-build (`build_win.sh`, mingw-w64) is included; the resulting
 `test_player.exe` depends only on `kernel32.dll`, `user32.dll`, and
 `winmm.dll`, so it runs on Windows 7 with no installed runtime.
 
+## License
+
+MIT. See [LICENSE](LICENSE), which also reproduces the upstream
+NostalgicPlayer copyright notice as required by its MIT terms.
+
 ## Style / conventions
 
 All players follow the project house style:
