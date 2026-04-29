@@ -12,7 +12,7 @@
 // Public API:
 //   struct soundfx_state *soundfx_init(void *data, uint32_t len, int32_t sample_rate);
 //   void soundfx_free(struct soundfx_state *s);
-//   void soundfx_get_audio(struct soundfx_state *s, int16_t *output, int32_t frames);
+//   void soundfx_get_audio(struct soundfx_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -639,7 +639,7 @@ static void soundfx_free(struct soundfx_state *s) {
 }
 
 // [=]===^=[ soundfx_get_audio ]==================================================================[=]
-static void soundfx_get_audio(struct soundfx_state *s, int16_t *output, int32_t frames) {
+static void soundfx_get_audio(struct soundfx_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -667,7 +667,7 @@ static void soundfx_api_free(void *state) {
 }
 
 // [=]===^=[ soundfx_api_get_audio ]==============================================================[=]
-static void soundfx_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void soundfx_api_get_audio(void *state, float *output, int32_t frames) {
 	soundfx_get_audio((struct soundfx_state *)state, output, frames);
 }
 

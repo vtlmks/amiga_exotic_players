@@ -8,7 +8,7 @@
 // Public API:
 //   struct artofnoise_state *artofnoise_init(void *data, uint32_t len, int32_t sample_rate);
 //   void artofnoise_free(struct artofnoise_state *s);
-//   void artofnoise_get_audio(struct artofnoise_state *s, int16_t *output, int32_t frames);
+//   void artofnoise_get_audio(struct artofnoise_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -1852,7 +1852,7 @@ static void artofnoise_free(struct artofnoise_state *s) {
 }
 
 // [=]===^=[ artofnoise_get_audio ]===============================================================[=]
-static void artofnoise_get_audio(struct artofnoise_state *s, int16_t *output, int32_t frames) {
+static void artofnoise_get_audio(struct artofnoise_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -1880,7 +1880,7 @@ static void artofnoise_api_free(void *state) {
 }
 
 // [=]===^=[ artofnoise_api_get_audio ]===========================================================[=]
-static void artofnoise_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void artofnoise_api_get_audio(void *state, float *output, int32_t frames) {
 	artofnoise_get_audio((struct artofnoise_state *)state, output, frames);
 }
 

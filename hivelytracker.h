@@ -19,7 +19,7 @@
 // Public API:
 //   struct hivelytracker_state *hivelytracker_init(void *data, uint32_t len, int32_t sample_rate);
 //   void hivelytracker_free(struct hivelytracker_state *s);
-//   void hivelytracker_get_audio(struct hivelytracker_state *s, int16_t *output, int32_t frames);
+//   void hivelytracker_get_audio(struct hivelytracker_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -2054,11 +2054,19 @@ static void hively_play_irq(struct hivelytracker_state *s) {
 
 // [=]===^=[ hively_mix_chunk ]===================================================================[=]
 //
-// Mixes one tick worth of samples and ACCUMULATES into the caller's int16 stereo
+// Mixes one tick worth of samples and ACCUMULATES into the caller's float stereo
 // output buffer (output is 2 * frames samples). Internal sample buffers in voice
 // are 0x280 bytes (with a duplicate sample at index 0x280 to act as a wrap
 // guard); positions are 16.16 fixed point indices into them.
-static void hively_mix_chunk(struct hivelytracker_state *s, int16_t *output, int32_t frames) {
+//
+// Normalization: a single voice at peak sample (|s|=128), max voice_volume (64),
+// max pan_l (255), and unity mix_gain (256) yields |1.0| on its side. No clamp
+// is applied; the host saturates at the final output stage.
+static void hively_mix_chunk(struct hivelytracker_state *s, float *output, int32_t frames) {
+	// Combined per-sample scale: sample(/128) * vol(/64) * pan(/255) * mix_gain(/256).
+	const float norm = 1.0f / (128.0f * 64.0f * 255.0f * 256.0f);
+	float gain = (float)s->song.mix_gain * norm;
+
 	int32_t chans = s->song.channels;
 	int8_t *src[HIVELY_MAX_CHANNELS];
 	int8_t *r_src[HIVELY_MAX_CHANNELS];
@@ -2067,8 +2075,8 @@ static void hively_mix_chunk(struct hivelytracker_state *s, int16_t *output, int
 	int32_t vol[HIVELY_MAX_CHANNELS];
 	int32_t pos[HIVELY_MAX_CHANNELS];
 	int32_t r_pos[HIVELY_MAX_CHANNELS];
-	int32_t pan_l[HIVELY_MAX_CHANNELS];
-	int32_t pan_r[HIVELY_MAX_CHANNELS];
+	float pan_l[HIVELY_MAX_CHANNELS];
+	float pan_r[HIVELY_MAX_CHANNELS];
 
 	for(int32_t i = 0; i < chans; ++i) {
 		struct hively_voice *voice = &s->voices[i];
@@ -2079,8 +2087,8 @@ static void hively_mix_chunk(struct hivelytracker_state *s, int16_t *output, int
 		vol[i] = voice->voice_volume;
 		pos[i] = voice->sample_pos;
 		src[i] = voice->mix_source;
-		pan_l[i] = s->waves->panning_left[pan];
-		pan_r[i] = s->waves->panning_right[pan];
+		pan_l[i] = (float)s->waves->panning_left[pan];
+		pan_r[i] = (float)s->waves->panning_right[pan];
 		r_delta[i] = voice->ring_delta != 0 ? voice->ring_delta : 1;
 		r_pos[i] = voice->ring_sample_pos;
 		r_src[i] = voice->ring_mix_source;
@@ -2108,38 +2116,25 @@ static void hively_mix_chunk(struct hivelytracker_state *s, int16_t *output, int
 		samples -= loops;
 
 		while(loops > 0) {
-			int32_t a = 0;
-			int32_t b = 0;
+			float a = 0.0f;
+			float b = 0.0f;
 			for(int32_t i = 0; i < chans; ++i) {
-				int32_t j;
+				float j;
 				if(r_src[i] != 0 && src[i] != 0) {
-					j = ((src[i][pos[i] >> 16] * r_src[i][r_pos[i] >> 16]) >> 7) * vol[i];
+					int32_t prod = (src[i][pos[i] >> 16] * r_src[i][r_pos[i] >> 16]) >> 7;
+					j = (float)(prod * vol[i]);
 					r_pos[i] += r_delta[i];
 				} else if(src[i] != 0) {
-					j = src[i][pos[i] >> 16] * vol[i];
+					j = (float)((int32_t)src[i][pos[i] >> 16] * vol[i]);
 				} else {
-					j = 0;
+					j = 0.0f;
 				}
-				a += (j * pan_l[i]) >> 7;
-				b += (j * pan_r[i]) >> 7;
+				a += j * pan_l[i];
+				b += j * pan_r[i];
 				pos[i] += delta[i];
 			}
-			a = (a * s->song.mix_gain) >> 8;
-			b = (b * s->song.mix_gain) >> 8;
-			if(a < -0x8000) { a = -0x8000; }
-			if(a >  0x7fff) { a =  0x7fff; }
-			if(b < -0x8000) { b = -0x8000; }
-			if(b >  0x7fff) { b =  0x7fff; }
-
-			int32_t la = (int32_t)output[out_offset * 2 + 0] + a;
-			int32_t lb = (int32_t)output[out_offset * 2 + 1] + b;
-			if(la < -0x8000) { la = -0x8000; }
-			if(la >  0x7fff) { la =  0x7fff; }
-			if(lb < -0x8000) { lb = -0x8000; }
-			if(lb >  0x7fff) { lb =  0x7fff; }
-			output[out_offset * 2 + 0] = (int16_t)la;
-			output[out_offset * 2 + 1] = (int16_t)lb;
-
+			output[out_offset * 2 + 0] += a * gain;
+			output[out_offset * 2 + 1] += b * gain;
 			loops--;
 			out_offset++;
 		}
@@ -2234,7 +2229,7 @@ static void hivelytracker_free(struct hivelytracker_state *s) {
 }
 
 // [=]===^=[ hivelytracker_get_audio ]============================================================[=]
-static void hivelytracker_get_audio(struct hivelytracker_state *s, int16_t *output, int32_t frames) {
+static void hivelytracker_get_audio(struct hivelytracker_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->tick_samples - s->tick_offset;
 		if(remain > frames) { remain = frames; }
@@ -2260,7 +2255,7 @@ static void hivelytracker_api_free(void *state) {
 }
 
 // [=]===^=[ hivelytracker_api_get_audio ]========================================================[=]
-static void hivelytracker_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void hivelytracker_api_get_audio(void *state, float *output, int32_t frames) {
 	hivelytracker_get_audio((struct hivelytracker_state *)state, output, frames);
 }
 

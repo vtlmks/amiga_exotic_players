@@ -8,13 +8,39 @@ Each player is a single header (`<player>.h`) that exposes:
 ```c
 struct <player>_state *<player>_init(void *data, uint32_t len, int32_t sample_rate);
 void <player>_free(struct <player>_state *s);
-void <player>_get_audio(struct <player>_state *s, int16_t *output, int32_t frames);
+void <player>_get_audio(struct <player>_state *s, float *output, int32_t frames);
 ```
 
 `_init` mallocs internal state and references the caller's module buffer for
-sample PCM. `_get_audio` accumulates int16 stereo frames at the rate given to
-`_init`; the caller is responsible for clearing the buffer first. `_free`
-releases the player's heap; the caller's module buffer is never touched.
+sample PCM. `_get_audio` ACCUMULATES interleaved float stereo frames into the
+caller's buffer at the rate given to `_init`, nominal range `[-1.0, 1.0]`. The
+caller is responsible for clearing the buffer first. Players do NOT clip; the
+host is responsible for any final saturation, dithering, or conversion to the
+audio backend's native sample format. `_free` releases the player's heap; the
+caller's module buffer is never touched.
+
+A common `struct player_api` table is exposed by every player and the test
+player iterates `player_api[]` to identify and drive a module.
+
+### Getting int16 PCM out
+
+For hosts that want signed 16-bit PCM, `player_api.h` provides a thin wrapper
+that drives the float path and converts with hard saturation. The scratch
+buffer is caller-owned so the hot path never allocates; reuse the same buffer
+across calls.
+
+```c
+#include "player_api.h"
+#include "<player>.h"
+
+float   scratch[FRAMES * 2];   // interleaved stereo, must hold frames*2 floats
+int16_t pcm[FRAMES * 2];
+
+player_get_audio_s16(&<player>_api, s, pcm, scratch, FRAMES);
+```
+
+The helper memsets the scratch to zero, calls `api->get_audio`, then clamps to
+`[-32768, 32767]` while converting to `int16_t`.
 
 A shared `paula.h` emulates a 32-channel virtual Paula (real Amiga has 4;
 formats like 7-voice Hippel, 8-channel OctaMed/Oktalyzer and up to 32-channel
@@ -49,7 +75,7 @@ Format names are taken from the NostalgicPlayer matrix.
 | Future Composer 1.0..1.4 | `.fc .fc14 .smod` | `futurecomposer.h` | Multi-sample (SSMP) handled. SMOD (FC 1.0..1.3) input is converted to FC14 in memory at load (FC1.3 player ROM wave-length and wave-table data is embedded) |
 | Game Music Creator | `.gmc` | `gamemusiccreator.h` | |
 | Hippel | `.hip .hipc .hip7` | `hippel.h` | Plain TFMX-marked, COSO-packed, and 7-voice variants. M68k scanner identify |
-| IFF SMUS | `.smus` | `iffsmus.h` | Score engine ports cleanly. **External `.instr`/`.ss` files not loaded; voices play silent. TODO** |
+| IFF SMUS | `.smus` | `iffsmus.h` | Score engine ports cleanly. **Known incomplete: external `.instr` / `.ss` instrument files are referenced by name but the on-disk format is not sufficiently documented to load them, so voices play silent.** |
 | InStereo! 1.0 | `.is .is10` | `instereo10.h` | LED filter is a no-op (TODO) |
 | InStereo! 2.0 | `.is .is20` | `instereo20.h` | |
 | JamCracker | `.jam` | `jamcracker.h` | |
@@ -100,7 +126,10 @@ C# behaviour.
 - **AMOS Music Bank / Digital Sound Studio / InStereo! 1.0**: Amiga LED
   low-pass filter (effects 0x0600 / 0x0700) is a no-op.
 - **Face The Music**: External sample mode falls back to silent.
-- **IFF SMUS**: External `.instr` / `.ss` files not loaded; voices silent.
+- **IFF SMUS**: Known incomplete. The score engine plays correctly, but the
+  external `.instr` / `.ss` instrument files referenced by SMUS scores are
+  not loaded: there is not enough public information about the on-disk
+  layout to write a faithful loader, so voices play silent.
 - **Med (1.12/2.00)**: MIDI events silently skipped; the C# may use them
   for tempo control.
 - **Voodoo Supreme Synthesizer**: jump-chain `while` loops use a

@@ -9,7 +9,7 @@
 // Public API:
 //   struct sample_state *sample_init(void *data, uint32_t len, int32_t sample_rate);
 //   void sample_free(struct sample_state *s);
-//   void sample_get_audio(struct sample_state *s, int16_t *output, int32_t frames);
+//   void sample_get_audio(struct sample_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -652,7 +652,8 @@ static void sample_free(struct sample_state *s) {
 }
 
 // [=]===^=[ sample_get_audio ]===================================================================[=]
-static void sample_get_audio(struct sample_state *s, int16_t *output, int32_t frames) {
+static void sample_get_audio(struct sample_state *s, float *output, int32_t frames) {
+	const float scale = 1.0f / 32768.0f;
 	uint64_t length_fp = (uint64_t)s->pcm_frames << SAMPLE_FP_SHIFT;
 	uint64_t loop_start_fp = (uint64_t)s->loop_start << SAMPLE_FP_SHIFT;
 	uint64_t loop_length_fp = (uint64_t)s->loop_length << SAMPLE_FP_SHIFT;
@@ -663,8 +664,6 @@ static void sample_get_audio(struct sample_state *s, int16_t *output, int32_t fr
 				uint64_t over = s->pos_fp - length_fp;
 				s->pos_fp = loop_start_fp + (over % loop_length_fp);
 			} else {
-				output[0] += 0;
-				output[1] += 0;
 				output += 2;
 				continue;
 			}
@@ -695,22 +694,8 @@ static void sample_get_audio(struct sample_state *s, int16_t *output, int32_t fr
 			left  = la + (((lb - la) * (int32_t)frac) >> SAMPLE_FP_SHIFT);
 			right = ra + (((rb - ra) * (int32_t)frac) >> SAMPLE_FP_SHIFT);
 		}
-		int32_t mixed_l = (int32_t)output[0] + left;
-		int32_t mixed_r = (int32_t)output[1] + right;
-		if(mixed_l > 32767) {
-			mixed_l = 32767;
-		}
-		if(mixed_l < -32768) {
-			mixed_l = -32768;
-		}
-		if(mixed_r > 32767) {
-			mixed_r = 32767;
-		}
-		if(mixed_r < -32768) {
-			mixed_r = -32768;
-		}
-		output[0] = (int16_t)mixed_l;
-		output[1] = (int16_t)mixed_r;
+		output[0] += (float)left  * scale;
+		output[1] += (float)right * scale;
 		output += 2;
 		s->pos_fp += s->step_fp;
 	}
@@ -727,7 +712,7 @@ static void sample_api_free(void *state) {
 }
 
 // [=]===^=[ sample_api_get_audio ]===============================================================[=]
-static void sample_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void sample_api_get_audio(void *state, float *output, int32_t frames) {
 	sample_get_audio((struct sample_state *)state, output, frames);
 }
 

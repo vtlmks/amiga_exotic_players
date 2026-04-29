@@ -7,7 +7,7 @@
 // Public API:
 //   struct deltamusic10_state *deltamusic10_init(void *data, uint32_t len, int32_t sample_rate);
 //   void deltamusic10_free(struct deltamusic10_state *s);
-//   void deltamusic10_get_audio(struct deltamusic10_state *s, int16_t *output, int32_t frames);
+//   void deltamusic10_get_audio(struct deltamusic10_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -905,7 +905,7 @@ static void deltamusic10_free(struct deltamusic10_state *s) {
 }
 
 // [=]===^=[ deltamusic10_get_audio ]==============================================================[=]
-static void deltamusic10_get_audio(struct deltamusic10_state *s, int16_t *output, int32_t frames) {
+static void deltamusic10_get_audio(struct deltamusic10_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -933,7 +933,7 @@ static void deltamusic10_api_free(void *state) {
 }
 
 // [=]===^=[ deltamusic10_api_get_audio ]=========================================================[=]
-static void deltamusic10_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void deltamusic10_api_get_audio(void *state, float *output, int32_t frames) {
 	deltamusic10_get_audio((struct deltamusic10_state *)state, output, frames);
 }
 

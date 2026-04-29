@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: MIT
 //
 // Minimal Amiga Paula emulator for custom replayers.
-// Reads 8-bit signed samples; writes interlaved int16 stereo frames.
+// Reads 8-bit signed samples; writes interleaved float stereo frames.
 // Hard-panned LRRL (Amiga native). All functions static.
+//
+// Output is ACCUMULATED into the caller's float buffer, nominally [-1.0, 1.0].
+// One channel at full volume (vol=64), hard pan, peak sample produces |1.0|.
+// No saturation is performed; the host is responsible for any final clipping.
 
 #pragma once
 
@@ -50,9 +54,9 @@ struct paula {
 	// final stereo output. Off unless paula_set_lp_filter(p, 1) is called.
 	// Coefficient is computed in paula_init from sample_rate.
 	int32_t lp_filter_on;
-	int32_t lp_alpha_q15;          // Q15 fixed-point smoothing coefficient
-	int32_t lp_state_l;            // Q15 last-output sample (left)
-	int32_t lp_state_r;
+	float lp_alpha;                // smoothing coefficient
+	float lp_state_l;              // last-output sample (left)
+	float lp_state_r;
 };
 
 // [=]===^=[ paula_init ]=========================================================================[=]
@@ -64,22 +68,21 @@ static void paula_init(struct paula *p, int32_t sample_rate, int32_t tick_rate_h
 	for(int32_t i = 0; i < PAULA_NUM_CHANNELS; ++i) {
 		p->ch[i].pan = ((i & 2) != 0) ^ ((i & 1) != 0) ? 127 : 0;
 	}
-	// Pre-compute the LED-filter Q15 coefficient for ~4 kHz cutoff:
+	// Pre-compute the LED-filter coefficient for ~4 kHz cutoff:
 	// alpha = dt / (RC + dt), where dt = 1 / sample_rate, RC = 1 / (2 PI fc).
-	// At sr=48000, fc=4000: alpha ~= 0.343 -> 0x2bdb in Q15.
+	// At sr=48000, fc=4000: alpha ~= 0.343.
 	{
 		double fc = 4000.0;
 		double dt = 1.0 / (double)sample_rate;
 		double rc = 1.0 / (2.0 * 3.14159265358979 * fc);
 		double a = dt / (rc + dt);
-		int32_t aq = (int32_t)(a * 32768.0 + 0.5);
-		if(aq < 1) {
-			aq = 1;
+		if(a < 0.0) {
+			a = 0.0;
 		}
-		if(aq > 32768) {
-			aq = 32768;
+		if(a > 1.0) {
+			a = 1.0;
 		}
-		p->lp_alpha_q15 = aq;
+		p->lp_alpha = (float)a;
 	}
 }
 
@@ -218,21 +221,25 @@ static void paula_mute(struct paula *p, int32_t idx) {
 }
 
 // [=]===^=[ paula_mix_frames ]===================================================================[=]
-// Accumulates `frames` int16 stereo frames into `output`. Caller must pre-clear.
-static void paula_mix_frames(struct paula *p, int16_t *output, int32_t frames) {
+// Accumulates `frames` float stereo frames into `output`. Caller must pre-clear.
+// One channel at full volume (vol=64), hard pan, peak sample (|s|=128) -> |1.0|.
+// No clipping is applied; the host saturates at the final output stage.
+static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
+	// Combined scaling: sample/128 (int8 -> [-1,1]) * volume/64 * pan/127.
+	const float vol_scale = 1.0f / (128.0f * 64.0f * 127.0f);
 	for(int32_t ci = 0; ci < PAULA_NUM_CHANNELS; ++ci) {
 		struct paula_channel *c = &p->ch[ci];
 		if(!c->active || c->muted || c->sample == 0 || c->step_fp == 0) {
 			continue;
 		}
-		int32_t lvol = c->volume * (127 - c->pan);
-		int32_t rvol = c->volume * c->pan;
+		float lvol = (float)c->volume * (float)(127 - c->pan) * vol_scale;
+		float rvol = (float)c->volume * (float)c->pan         * vol_scale;
 		uint32_t step = c->step_fp;
 		uint32_t length = c->length_fp;
 		uint32_t loop_start = c->loop_start_fp;
 		uint32_t loop_length = c->loop_length_fp;
 		int8_t *sdat = c->sample;
-		int16_t *out = output;
+		float *out = output;
 		if(!c->backwards) {
 			uint32_t pos = c->pos_fp;
 			for(int32_t i = 0; i < frames; ++i) {
@@ -255,23 +262,9 @@ static void paula_mix_frames(struct paula *p, int16_t *output, int32_t frames) {
 						break;
 					}
 				}
-				int32_t s = sdat[pos >> PAULA_FP_SHIFT];
-				int32_t l = (s * lvol) >> 6;
-				int32_t r = (s * rvol) >> 6;
-				int32_t nl = out[0] + l;
-				int32_t nr = out[1] + r;
-				if(nl > 32767) {
-					nl = 32767;
-				} else if(nl < -32768) {
-					nl = -32768;
-				}
-				if(nr > 32767) {
-					nr = 32767;
-				} else if(nr < -32768) {
-					nr = -32768;
-				}
-				out[0] = (int16_t)nl;
-				out[1] = (int16_t)nr;
+				float s = (float)sdat[pos >> PAULA_FP_SHIFT];
+				out[0] += s * lvol;
+				out[1] += s * rvol;
 				out += 2;
 				pos += step;
 			}
@@ -293,23 +286,9 @@ static void paula_mix_frames(struct paula *p, int16_t *output, int32_t frames) {
 						break;
 					}
 				}
-				int32_t s = sdat[(uint32_t)pos >> PAULA_FP_SHIFT];
-				int32_t l = (s * lvol) >> 6;
-				int32_t r = (s * rvol) >> 6;
-				int32_t nl = out[0] + l;
-				int32_t nr = out[1] + r;
-				if(nl > 32767) {
-					nl = 32767;
-				} else if(nl < -32768) {
-					nl = -32768;
-				}
-				if(nr > 32767) {
-					nr = 32767;
-				} else if(nr < -32768) {
-					nr = -32768;
-				}
-				out[0] = (int16_t)nl;
-				out[1] = (int16_t)nr;
+				float s = (float)sdat[(uint32_t)pos >> PAULA_FP_SHIFT];
+				out[0] += s * lvol;
+				out[1] += s * rvol;
 				out += 2;
 				pos -= (int64_t)step;
 			}
@@ -320,29 +299,15 @@ static void paula_mix_frames(struct paula *p, int16_t *output, int32_t frames) {
 	// Amiga LED filter: 1-pole IIR over the final stereo output.
 	// y[n] = y[n-1] + alpha * (x[n] - y[n-1]).
 	if(p->lp_filter_on) {
-		int32_t a = p->lp_alpha_q15;
-		int32_t yl = p->lp_state_l;
-		int32_t yr = p->lp_state_r;
-		int16_t *out = output;
+		float a = p->lp_alpha;
+		float yl = p->lp_state_l;
+		float yr = p->lp_state_r;
+		float *out = output;
 		for(int32_t i = 0; i < frames; ++i) {
-			int32_t xl = (int32_t)out[0] << 15;
-			int32_t xr = (int32_t)out[1] << 15;
-			yl = yl + (((int64_t)(xl - yl) * a) >> 15);
-			yr = yr + (((int64_t)(xr - yr) * a) >> 15);
-			int32_t ol = yl >> 15;
-			int32_t or_ = yr >> 15;
-			if(ol > 32767) {
-				ol = 32767;
-			} else if(ol < -32768) {
-				ol = -32768;
-			}
-			if(or_ > 32767) {
-				or_ = 32767;
-			} else if(or_ < -32768) {
-				or_ = -32768;
-			}
-			out[0] = (int16_t)ol;
-			out[1] = (int16_t)or_;
+			yl += (out[0] - yl) * a;
+			yr += (out[1] - yr) * a;
+			out[0] = yl;
+			out[1] = yr;
 			out += 2;
 		}
 		p->lp_state_l = yl;

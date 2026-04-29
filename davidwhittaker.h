@@ -13,7 +13,7 @@
 // Public API:
 //   struct davidwhittaker_state *davidwhittaker_init(void *data, uint32_t len, int32_t sample_rate);
 //   void davidwhittaker_free(struct davidwhittaker_state *s);
-//   void davidwhittaker_get_audio(struct davidwhittaker_state *s, int16_t *output, int32_t frames);
+//   void davidwhittaker_get_audio(struct davidwhittaker_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -2263,7 +2263,7 @@ static void davidwhittaker_free(struct davidwhittaker_state *s) {
 }
 
 // [=]===^=[ davidwhittaker_get_audio ]===========================================================[=]
-static void davidwhittaker_get_audio(struct davidwhittaker_state *s, int16_t *output, int32_t frames) {
+static void davidwhittaker_get_audio(struct davidwhittaker_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -2291,7 +2291,7 @@ static void davidwhittaker_api_free(void *state) {
 }
 
 // [=]===^=[ davidwhittaker_api_get_audio ]=======================================================[=]
-static void davidwhittaker_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void davidwhittaker_api_get_audio(void *state, float *output, int32_t frames) {
 	davidwhittaker_get_audio((struct davidwhittaker_state *)state, output, frames);
 }
 

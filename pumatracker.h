@@ -7,7 +7,7 @@
 // Public API:
 //   struct pumatracker_state *pumatracker_init(void *data, uint32_t len, int32_t sample_rate);
 //   void pumatracker_free(struct pumatracker_state *s);
-//   void pumatracker_get_audio(struct pumatracker_state *s, int16_t *output, int32_t frames);
+//   void pumatracker_get_audio(struct pumatracker_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -1039,7 +1039,7 @@ static void pumatracker_free(struct pumatracker_state *s) {
 }
 
 // [=]===^=[ pumatracker_get_audio ]==============================================================[=]
-static void pumatracker_get_audio(struct pumatracker_state *s, int16_t *output, int32_t frames) {
+static void pumatracker_get_audio(struct pumatracker_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -1067,7 +1067,7 @@ static void pumatracker_api_free(void *state) {
 }
 
 // [=]===^=[ pumatracker_api_get_audio ]==========================================================[=]
-static void pumatracker_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void pumatracker_api_get_audio(void *state, float *output, int32_t frames) {
 	pumatracker_get_audio((struct pumatracker_state *)state, output, frames);
 }
 

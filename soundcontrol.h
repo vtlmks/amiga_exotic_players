@@ -7,7 +7,7 @@
 // Public API:
 //   struct soundcontrol_state *soundcontrol_init(void *data, uint32_t len, int32_t sample_rate);
 //   void soundcontrol_free(struct soundcontrol_state *s);
-//   void soundcontrol_get_audio(struct soundcontrol_state *s, int16_t *output, int32_t frames);
+//   void soundcontrol_get_audio(struct soundcontrol_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -1259,7 +1259,7 @@ static void soundcontrol_free(struct soundcontrol_state *s) {
 }
 
 // [=]===^=[ soundcontrol_get_audio ]=============================================================[=]
-static void soundcontrol_get_audio(struct soundcontrol_state *s, int16_t *output, int32_t frames) {
+static void soundcontrol_get_audio(struct soundcontrol_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -1287,7 +1287,7 @@ static void soundcontrol_api_free(void *state) {
 }
 
 // [=]===^=[ soundcontrol_api_get_audio ]=========================================================[=]
-static void soundcontrol_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void soundcontrol_api_get_audio(void *state, float *output, int32_t frames) {
 	soundcontrol_get_audio((struct soundcontrol_state *)state, output, frames);
 }
 

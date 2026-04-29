@@ -23,7 +23,7 @@
 // Public API:
 //   struct tfmx_state *tfmx_init(void *data, uint32_t len, int32_t sample_rate);
 //   void tfmx_free(struct tfmx_state *s);
-//   void tfmx_get_audio(struct tfmx_state *s, int16_t *output, int32_t frames);
+//   void tfmx_get_audio(struct tfmx_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -2453,11 +2453,11 @@ static void tfmx_free(struct tfmx_state *s) {
 // [=]===^=[ tfmx_get_audio ]=====================================================================[=]
 // Sample-rate-driven mixing loop. We service ticks at the rate set by the
 // engine (default 50 Hz, but track commands change it via SetRate/SetBpm).
-static void tfmx_get_audio(struct tfmx_state *s, int16_t *output, int32_t frames) {
+static void tfmx_get_audio(struct tfmx_state *s, float *output, int32_t frames) {
 	if(!s || !output || (frames <= 0)) {
 		return;
 	}
-	memset(output, 0, sizeof(int16_t) * 2 * (size_t)frames);
+	memset(output, 0, sizeof(float) * 2 * (size_t)frames);
 
 	int32_t produced = 0;
 	while(produced < frames) {
@@ -2496,7 +2496,7 @@ static void tfmx_api_free(void *state) {
 }
 
 // [=]===^=[ tfmx_api_get_audio ]=================================================================[=]
-static void tfmx_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void tfmx_api_get_audio(void *state, float *output, int32_t frames) {
 	tfmx_get_audio((struct tfmx_state *)state, output, frames);
 }
 

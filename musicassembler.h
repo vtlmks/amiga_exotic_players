@@ -7,7 +7,7 @@
 // Public API:
 //   struct musicassembler_state *musicassembler_init(void *data, uint32_t len, int32_t sample_rate);
 //   void musicassembler_free(struct musicassembler_state *s);
-//   void musicassembler_get_audio(struct musicassembler_state *s, int16_t *output, int32_t frames);
+//   void musicassembler_get_audio(struct musicassembler_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -1242,7 +1242,7 @@ static void musicassembler_free(struct musicassembler_state *s) {
 }
 
 // [=]===^=[ musicassembler_get_audio ]===========================================================[=]
-static void musicassembler_get_audio(struct musicassembler_state *s, int16_t *output, int32_t frames) {
+static void musicassembler_get_audio(struct musicassembler_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -1270,7 +1270,7 @@ static void musicassembler_api_free(void *state) {
 }
 
 // [=]===^=[ musicassembler_api_get_audio ]=======================================================[=]
-static void musicassembler_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void musicassembler_api_get_audio(void *state, float *output, int32_t frames) {
 	musicassembler_get_audio((struct musicassembler_state *)state, output, frames);
 }
 

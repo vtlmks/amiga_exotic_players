@@ -7,7 +7,7 @@
 // Public API:
 //   struct instereo20_state *instereo20_init(void *data, uint32_t len, int32_t sample_rate);
 //   void instereo20_free(struct instereo20_state *s);
-//   void instereo20_get_audio(struct instereo20_state *s, int16_t *output, int32_t frames);
+//   void instereo20_get_audio(struct instereo20_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -1228,7 +1228,7 @@ static void instereo20_free(struct instereo20_state *s) {
 }
 
 // [=]===^=[ instereo20_get_audio ]===============================================================[=]
-static void instereo20_get_audio(struct instereo20_state *s, int16_t *output, int32_t frames) {
+static void instereo20_get_audio(struct instereo20_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -1256,7 +1256,7 @@ static void instereo20_api_free(void *state) {
 }
 
 // [=]===^=[ instereo20_api_get_audio ]===========================================================[=]
-static void instereo20_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void instereo20_api_get_audio(void *state, float *output, int32_t frames) {
 	instereo20_get_audio((struct instereo20_state *)state, output, frames);
 }
 

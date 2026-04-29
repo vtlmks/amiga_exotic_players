@@ -369,16 +369,22 @@ static int32_t open_waveout(HWAVEOUT *out_h) {
 }
 
 // [=]===^=[ apply_crossfeed ]====================================================================[=]
-static void apply_crossfeed(int16_t *buf, int32_t frames, int32_t self_q15, int32_t xf_q15) {
+static void apply_crossfeed(float *buf, int32_t frames, float self_amt, float xf) {
 	for(int32_t j = 0; j < frames; ++j) {
-		int32_t l = buf[j * 2 + 0];
-		int32_t r = buf[j * 2 + 1];
-		int32_t nl = (l * self_q15 + r * xf_q15) >> 15;
-		int32_t nr = (r * self_q15 + l * xf_q15) >> 15;
-		if(nl > 32767) { nl = 32767; } else if(nl < -32768) { nl = -32768; }
-		if(nr > 32767) { nr = 32767; } else if(nr < -32768) { nr = -32768; }
-		buf[j * 2 + 0] = (int16_t)nl;
-		buf[j * 2 + 1] = (int16_t)nr;
+		float l = buf[j * 2 + 0];
+		float r = buf[j * 2 + 1];
+		buf[j * 2 + 0] = l * self_amt + r * xf;
+		buf[j * 2 + 1] = r * self_amt + l * xf;
+	}
+}
+
+// [=]===^=[ float_to_s16 ]=======================================================================[=]
+static void float_to_s16(int16_t *dst, float *src, int32_t count) {
+	for(int32_t i = 0; i < count; ++i) {
+		float v = src[i] * 32767.0f;
+		if(v >  32767.0f) { v =  32767.0f; }
+		if(v < -32768.0f) { v = -32768.0f; }
+		dst[i] = (int16_t)v;
 	}
 }
 
@@ -452,9 +458,12 @@ static int32_t run_player(const char *path) {
 
 	WAVEHDR hdrs[NUM_WAVE_BUFFERS];
 	int16_t *bufs[NUM_WAVE_BUFFERS];
-	int32_t buf_bytes = FRAMES_PER_PERIOD * NUM_CHANNELS * (int32_t)sizeof(int16_t);
+	float *fbufs[NUM_WAVE_BUFFERS];
+	int32_t buf_samples = FRAMES_PER_PERIOD * NUM_CHANNELS;
+	int32_t buf_bytes = buf_samples * (int32_t)sizeof(int16_t);
 	for(int32_t i = 0; i < NUM_WAVE_BUFFERS; ++i) {
-		bufs[i] = (int16_t *)calloc(FRAMES_PER_PERIOD * NUM_CHANNELS, sizeof(int16_t));
+		bufs[i]  = (int16_t *)calloc(buf_samples, sizeof(int16_t));
+		fbufs[i] = (float *)  calloc(buf_samples, sizeof(float));
 		memset(&hdrs[i], 0, sizeof(hdrs[i]));
 		hdrs[i].lpData = (LPSTR)bufs[i];
 		hdrs[i].dwBufferLength = (DWORD)buf_bytes;
@@ -463,8 +472,8 @@ static int32_t run_player(const char *path) {
 
 	printf("playing (ctrl+c to exit)\n");
 
-	int32_t xf_q15;
-	int32_t self_q15;
+	float xf;
+	float self_amt;
 	{
 		int32_t xf_pct = 40;
 		char env[16];
@@ -474,18 +483,19 @@ static int32_t run_player(const char *path) {
 			if(xf_pct < 0) { xf_pct = 0; }
 			if(xf_pct > 50) { xf_pct = 50; }
 		}
-		xf_q15 = (xf_pct * 32768 + 50) / 100;
-		self_q15 = 32768 - xf_q15;
+		xf = (float)xf_pct * 0.01f;
+		self_amt = 1.0f - xf;
 		printf("crossfeed: %d%% (each ear: %d%% own, %d%% other)\n",
 			xf_pct, 100 - xf_pct, xf_pct);
 	}
 
 	for(int32_t i = 0; i < NUM_WAVE_BUFFERS; ++i) {
-		memset(bufs[i], 0, (size_t)buf_bytes);
-		api->get_audio(state, bufs[i], FRAMES_PER_PERIOD);
-		if(xf_q15 != 0) {
-			apply_crossfeed(bufs[i], FRAMES_PER_PERIOD, self_q15, xf_q15);
+		memset(fbufs[i], 0, (size_t)buf_samples * sizeof(float));
+		api->get_audio(state, fbufs[i], FRAMES_PER_PERIOD);
+		if(xf > 0.0f) {
+			apply_crossfeed(fbufs[i], FRAMES_PER_PERIOD, self_amt, xf);
 		}
+		float_to_s16(bufs[i], fbufs[i], buf_samples);
 		waveOutWrite(wave, &hdrs[i], sizeof(hdrs[i]));
 	}
 
@@ -495,11 +505,12 @@ static int32_t run_player(const char *path) {
 			if((hdrs[i].dwFlags & WHDR_DONE) == 0) {
 				continue;
 			}
-			memset(bufs[i], 0, (size_t)buf_bytes);
-			api->get_audio(state, bufs[i], FRAMES_PER_PERIOD);
-			if(xf_q15 != 0) {
-				apply_crossfeed(bufs[i], FRAMES_PER_PERIOD, self_q15, xf_q15);
+			memset(fbufs[i], 0, (size_t)buf_samples * sizeof(float));
+			api->get_audio(state, fbufs[i], FRAMES_PER_PERIOD);
+			if(xf > 0.0f) {
+				apply_crossfeed(fbufs[i], FRAMES_PER_PERIOD, self_amt, xf);
 			}
+			float_to_s16(bufs[i], fbufs[i], buf_samples);
 			waveOutWrite(wave, &hdrs[i], sizeof(hdrs[i]));
 			any_filled = 1;
 		}
@@ -513,6 +524,7 @@ static int32_t run_player(const char *path) {
 	for(int32_t i = 0; i < NUM_WAVE_BUFFERS; ++i) {
 		waveOutUnprepareHeader(wave, &hdrs[i], sizeof(hdrs[i]));
 		free(bufs[i]);
+		free(fbufs[i]);
 	}
 	waveOutClose(wave);
 	api->free(state);

@@ -357,7 +357,7 @@ static snd_pcm_t *open_alsa(void) {
 	}
 
 	err = snd_pcm_set_params(pcm,
-	    SND_PCM_FORMAT_S16_LE,
+	    SND_PCM_FORMAT_FLOAT_LE,
 	    SND_PCM_ACCESS_RW_INTERLEAVED,
 	    NUM_CHANNELS,
 	    SAMPLE_RATE,
@@ -459,7 +459,7 @@ int main(int argc, char **argv) {
 
 	signal(SIGINT, on_sigint);
 
-	int16_t *buffer = (int16_t *)calloc(FRAMES_PER_PERIOD * NUM_CHANNELS, sizeof(int16_t));
+	float *fbuffer = (float *)calloc(FRAMES_PER_PERIOD * NUM_CHANNELS, sizeof(float));
 	fprintf(stdout, "playing (ctrl+c to exit)\n");
 
 	// Headphone crossfeed: hard-panned Amiga stereo is brutal in headphones.
@@ -467,8 +467,8 @@ int main(int argc, char **argv) {
 	// other before output. CROSSFEED env var controls the fraction in
 	// percent (0..50, default 40). 0 = pure stereo passthrough; 50 = mono.
 	// At 40 each ear keeps 60% of its own signal and picks up 40% of the other.
-	int32_t xf_q15;       // crossfeed amount as Q15 fixed-point (0..16384)
-	int32_t self_q15;     // self-amount = 32768 - 2*xf_q15  (so L+R sum is preserved)
+	float xf;             // crossfeed amount (0..0.5)
+	float self_amt;       // self-amount = 1 - xf, preserves L+R sum
 	{
 		int32_t xf_pct = 40;
 		const char *env = getenv("CROSSFEED");
@@ -481,38 +481,26 @@ int main(int argc, char **argv) {
 				xf_pct = 50;
 			}
 		}
-		xf_q15 = (xf_pct * 32768 + 50) / 100;
-		self_q15 = 32768 - xf_q15;
+		xf = (float)xf_pct * 0.01f;
+		self_amt = 1.0f - xf;
 		fprintf(stdout, "crossfeed: %d%% (each ear: %d%% own, %d%% other)\n",
 			xf_pct, 100 - xf_pct, xf_pct);
 	}
 
 	while(g_running) {
-		memset(buffer, 0, FRAMES_PER_PERIOD * NUM_CHANNELS * sizeof(int16_t));
-		api->get_audio(state, buffer, FRAMES_PER_PERIOD);
+		memset(fbuffer, 0, FRAMES_PER_PERIOD * NUM_CHANNELS * sizeof(float));
+		api->get_audio(state, fbuffer, FRAMES_PER_PERIOD);
 
-		if(xf_q15 != 0) {
+		if(xf > 0.0f) {
 			for(int32_t i = 0; i < FRAMES_PER_PERIOD; ++i) {
-				int32_t l = buffer[i * 2 + 0];
-				int32_t r = buffer[i * 2 + 1];
-				int32_t nl = (l * self_q15 + r * xf_q15) >> 15;
-				int32_t nr = (r * self_q15 + l * xf_q15) >> 15;
-				if(nl > 32767) {
-					nl = 32767;
-				} else if(nl < -32768) {
-					nl = -32768;
-				}
-				if(nr > 32767) {
-					nr = 32767;
-				} else if(nr < -32768) {
-					nr = -32768;
-				}
-				buffer[i * 2 + 0] = (int16_t)nl;
-				buffer[i * 2 + 1] = (int16_t)nr;
+				float l = fbuffer[i * 2 + 0];
+				float r = fbuffer[i * 2 + 1];
+				fbuffer[i * 2 + 0] = l * self_amt + r * xf;
+				fbuffer[i * 2 + 1] = r * self_amt + l * xf;
 			}
 		}
 
-		snd_pcm_sframes_t written = snd_pcm_writei(pcm, buffer, FRAMES_PER_PERIOD);
+		snd_pcm_sframes_t written = snd_pcm_writei(pcm, fbuffer, FRAMES_PER_PERIOD);
 		if(written < 0) {
 			if(snd_pcm_recover(pcm, (int)written, 1) < 0) {
 				fprintf(stderr, "alsa unrecoverable\n");
@@ -524,7 +512,7 @@ int main(int argc, char **argv) {
 	fprintf(stdout, "\nshutting down\n");
 	snd_pcm_drop(pcm);
 	snd_pcm_close(pcm);
-	free(buffer);
+	free(fbuffer);
 	api->free(state);
 	free(data);
 	free(base_dir);

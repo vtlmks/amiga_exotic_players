@@ -8,7 +8,7 @@
 // Public API:
 //   struct digitalsoundstudio_state *digitalsoundstudio_init(void *data, uint32_t len, int32_t sample_rate);
 //   void digitalsoundstudio_free(struct digitalsoundstudio_state *s);
-//   void digitalsoundstudio_get_audio(struct digitalsoundstudio_state *s, int16_t *output, int32_t frames);
+//   void digitalsoundstudio_get_audio(struct digitalsoundstudio_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -1239,7 +1239,7 @@ static void digitalsoundstudio_free(struct digitalsoundstudio_state *s) {
 }
 
 // [=]===^=[ digitalsoundstudio_get_audio ]=======================================================[=]
-static void digitalsoundstudio_get_audio(struct digitalsoundstudio_state *s, int16_t *output, int32_t frames) {
+static void digitalsoundstudio_get_audio(struct digitalsoundstudio_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -1267,7 +1267,7 @@ static void digitalsoundstudio_api_free(void *state) {
 }
 
 // [=]===^=[ digitalsoundstudio_api_get_audio ]===================================================[=]
-static void digitalsoundstudio_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void digitalsoundstudio_api_get_audio(void *state, float *output, int32_t frames) {
 	digitalsoundstudio_get_audio((struct digitalsoundstudio_state *)state, output, frames);
 }
 

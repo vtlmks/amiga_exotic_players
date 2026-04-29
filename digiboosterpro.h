@@ -7,7 +7,7 @@
 // Public API:
 //   struct digiboosterpro_state *digiboosterpro_init(void *data, uint32_t len, int32_t sample_rate);
 //   void digiboosterpro_free(struct digiboosterpro_state *s);
-//   void digiboosterpro_get_audio(struct digiboosterpro_state *s, int16_t *output, int32_t frames);
+//   void digiboosterpro_get_audio(struct digiboosterpro_state *s, float *output, int32_t frames);
 //
 // Scope and intentional exclusions:
 //   - Standard sequencer (orders, patterns, rows, ticks, BPM/speed) is implemented.
@@ -2281,7 +2281,7 @@ static void digiboosterpro_free(struct dbpro_state *s) {
 }
 
 // [=]===^=[ digiboosterpro_get_audio ]===========================================================[=]
-static void digiboosterpro_get_audio(struct dbpro_state *s, int16_t *output, int32_t frames) {
+static void digiboosterpro_get_audio(struct dbpro_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -2309,7 +2309,7 @@ static void digiboosterpro_api_free(void *state) {
 }
 
 // [=]===^=[ digiboosterpro_api_get_audio ]=======================================================[=]
-static void digiboosterpro_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void digiboosterpro_api_get_audio(void *state, float *output, int32_t frames) {
 	digiboosterpro_get_audio((struct dbpro_state *)state, output, frames);
 }
 

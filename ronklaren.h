@@ -12,7 +12,7 @@
 // Public API:
 //   struct ronklaren_state *ronklaren_init(void *data, uint32_t len, int32_t sample_rate);
 //   void ronklaren_free(struct ronklaren_state *s);
-//   void ronklaren_get_audio(struct ronklaren_state *s, int16_t *output, int32_t frames);
+//   void ronklaren_get_audio(struct ronklaren_state *s, float *output, int32_t frames);
 
 #pragma once
 
@@ -1763,7 +1763,7 @@ static void ronklaren_free(struct ronklaren_state *s) {
 }
 
 // [=]===^=[ ronklaren_get_audio ]================================================================[=]
-static void ronklaren_get_audio(struct ronklaren_state *s, int16_t *output, int32_t frames) {
+static void ronklaren_get_audio(struct ronklaren_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
 		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) {
@@ -1791,7 +1791,7 @@ static void ronklaren_api_free(void *state) {
 }
 
 // [=]===^=[ ronklaren_api_get_audio ]============================================================[=]
-static void ronklaren_api_get_audio(void *state, int16_t *output, int32_t frames) {
+static void ronklaren_api_get_audio(void *state, float *output, int32_t frames) {
 	ronklaren_get_audio((struct ronklaren_state *)state, output, frames);
 }
 
