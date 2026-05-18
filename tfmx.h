@@ -41,6 +41,10 @@
 #define TFMX_MACRO_CMD_COUNT   0x40
 #define TFMX_PATT_CMD_COUNT    16
 #define TFMX_DEFAULT_TICK_HZ   50
+// Paula DMA period of the 7-voice ch3 software-mix output (Hippel/Huelsbeck
+// mixing routine). Fidelity-only: each soft voice steps at its own pitch,
+// so this does not move pitch. A/B'd against UADE's TFMX-7V.
+#define TFMX_7V_CH3_PERIOD     320
 
 struct tfmx_module_offsets {
 	uint32_t header;
@@ -268,6 +272,29 @@ struct tfmx_input {
 	int32_t start_song_hint;
 };
 
+// Hybrid-7V soft voice. TFMX "7 voices" mode (Hippel's mixing routine that
+// Huelsbeck ported into TFMX) plays three voices directly on Paula channels
+// 0,1,2 and CPU-sums the rest into a single buffer DMA'd through Paula
+// channel 3. Mix law (libtfmxaudiodecoder LamePaulaMixer::getSample_7V):
+// per output sample, sum (int8 sample * volume / 64) of the soft voices,
+// then hard-clamp the total to signed 8-bit.
+struct tfmx_softvoice {
+	int8_t *sample;
+	uint32_t length;
+	uint32_t loop_start;
+	uint32_t loop_length;          // 0 => one-shot
+	uint32_t pos;
+	uint32_t period;               // Paula period (pitch)
+	uint64_t step_q;               // sample bytes per ch3 output sample, Q32
+	uint64_t step_acc;
+	int8_t *pending_sample;
+	uint32_t pending_pos;
+	uint32_t pending_length;
+	uint16_t volume;               // 0..64
+	uint8_t has_pending;
+	uint8_t active;
+};
+
 struct tfmx_state {
 	struct paula paula;
 	int32_t sample_rate;
@@ -301,6 +328,14 @@ struct tfmx_state {
 	uint8_t track_cmd_used[TFMX_TRACK_CMD_MAX + 1];
 	uint8_t pattern_cmd_used[TFMX_PATT_CMD_COUNT];
 	uint8_t macro_cmd_used[TFMX_MACRO_CMD_COUNT];
+
+	// Hybrid-7V CPU submixer (only used in 7-voice mode). Soft voices are
+	// the ones with voice_num >= 3 (voice_num 0,1,2 stay on real Paula
+	// channels). voice_num ranges 0..7, so 5 soft slots cover 3..7.
+	struct tfmx_softvoice softv[5];
+	int8_t *softmix_buf;
+	uint32_t softmix_cap;
+	int32_t softmix_period;
 };
 
 static uint16_t tfmx_periods[] = {
@@ -446,6 +481,196 @@ static uint16_t tfmx_note_to_period(int32_t note) {
 	return tfmx_periods[note + 13];
 }
 
+// 7-voice routing: voice_num 0,1,2 are real Paula channels; in 7V mode
+// (voice_count >= 7) voice_num >= 3 are CPU-summed into Paula channel 3.
+// 4-voice TFMX keeps all four voices on real channels (hardware as-is).
+// [=]===^=[ tfmx_is_soft ]=======================================================================[=]
+static int32_t tfmx_is_soft(struct tfmx_state *s, int32_t voice_num) {
+	return (s->voice_count >= 7) && (voice_num >= 3);
+}
+
+// [=]===^=[ tfmx_pch_play_sample ]===============================================================[=]
+static void tfmx_pch_play_sample(struct tfmx_state *s, int32_t vn, int8_t *sample, uint32_t length) {
+	if(!tfmx_is_soft(s, vn)) {
+		paula_play_sample(&s->paula, vn, sample, length);
+		return;
+	}
+	struct tfmx_softvoice *v = &s->softv[vn - 3];
+	v->sample = sample;
+	v->length = length;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = 0;
+	v->step_acc = 0;
+	v->has_pending = 0;
+	v->pending_sample = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ tfmx_pch_set_pos ]===================================================================[=]
+static void tfmx_pch_set_pos(struct tfmx_state *s, int32_t vn, uint32_t byte_offset) {
+	if(!tfmx_is_soft(s, vn)) {
+		paula_set_pos(&s->paula, vn, byte_offset);
+		return;
+	}
+	struct tfmx_softvoice *v = &s->softv[vn - 3];
+	if(v->sample == 0 || v->length == 0) {
+		v->pos = 0;
+		return;
+	}
+	if(byte_offset >= v->length) {
+		byte_offset = v->length - 1;
+	}
+	v->pos = byte_offset;
+}
+
+// [=]===^=[ tfmx_pch_set_loop ]==================================================================[=]
+static void tfmx_pch_set_loop(struct tfmx_state *s, int32_t vn, uint32_t start, uint32_t length) {
+	if(!tfmx_is_soft(s, vn)) {
+		paula_set_loop(&s->paula, vn, start, length);
+		return;
+	}
+	struct tfmx_softvoice *v = &s->softv[vn - 3];
+	v->loop_start = start;
+	v->loop_length = length;
+}
+
+// [=]===^=[ tfmx_pch_set_period ]================================================================[=]
+static void tfmx_pch_set_period(struct tfmx_state *s, int32_t vn, uint16_t period) {
+	if(!tfmx_is_soft(s, vn)) {
+		paula_set_period(&s->paula, vn, period);
+		return;
+	}
+	s->softv[vn - 3].period = period;
+}
+
+// [=]===^=[ tfmx_pch_set_volume ]================================================================[=]
+static void tfmx_pch_set_volume(struct tfmx_state *s, int32_t vn, uint16_t volume) {
+	if(!tfmx_is_soft(s, vn)) {
+		paula_set_volume(&s->paula, vn, volume);
+		return;
+	}
+	if(volume > 64) {
+		volume = 64;
+	}
+	s->softv[vn - 3].volume = volume;
+}
+
+// [=]===^=[ tfmx_pch_queue_sample ]==============================================================[=]
+static void tfmx_pch_queue_sample(struct tfmx_state *s, int32_t vn, int8_t *sample, uint32_t start_offset, uint32_t length) {
+	if(!tfmx_is_soft(s, vn)) {
+		paula_queue_sample(&s->paula, vn, sample, start_offset, length);
+		return;
+	}
+	struct tfmx_softvoice *v = &s->softv[vn - 3];
+	if(!v->active && sample != 0 && length > 0) {
+		v->sample = sample;
+		v->pos = start_offset;
+		v->length = start_offset + length;
+		v->step_acc = 0;
+		v->has_pending = 0;
+		v->pending_sample = 0;
+		v->active = 1;
+		return;
+	}
+	v->pending_sample = sample;
+	v->pending_pos = start_offset;
+	v->pending_length = start_offset + length;
+	v->has_pending = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ tfmx_pch_mute ]======================================================================[=]
+static void tfmx_pch_mute(struct tfmx_state *s, int32_t vn) {
+	if(!tfmx_is_soft(s, vn)) {
+		paula_mute(&s->paula, vn);
+		return;
+	}
+	s->softv[vn - 3].active = 0;
+}
+
+// [=]===^=[ tfmx_softvoice_advance ]=============================================================[=]
+static void tfmx_softvoice_advance(struct tfmx_softvoice *v) {
+	uint32_t np = v->pos + 1;
+	if(np >= v->length) {
+		if(v->has_pending) {
+			v->sample = v->pending_sample;
+			np = v->pending_pos;
+			v->length = v->pending_length;
+			v->has_pending = 0;
+			v->pending_sample = 0;
+		} else if(v->loop_length > 0) {
+			uint32_t over = np - v->length;
+			np = v->loop_start + (over % v->loop_length);
+			v->length = v->loop_start + v->loop_length;
+		} else {
+			v->active = 0;
+			return;
+		}
+	}
+	v->pos = np;
+}
+
+// [=]===^=[ tfmx_softmix_refill ]================================================================[=]
+// Regenerate Paula channel 3's DMA buffer from the soft voices for the next
+// player tick and (re)arm channel 3. See tfmx_softvoice / getSample_7V.
+static void tfmx_softmix_refill(struct tfmx_state *s) {
+	int32_t cp = s->softmix_period;
+	uint32_t fpt = s->frames_per_tick_fp >> 16;
+	if(fpt == 0) {
+		fpt = 1;
+	}
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)fpt)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	if(n > s->softmix_cap) {
+		uint32_t nc = s->softmix_cap ? s->softmix_cap : 1024;
+		while(nc < n) {
+			nc <<= 1;
+		}
+		int8_t *nb = (int8_t *)realloc(s->softmix_buf, nc);
+		if(!nb) {
+			return;
+		}
+		s->softmix_buf = nb;
+		s->softmix_cap = nc;
+	}
+	for(int32_t i = 0; i < 5; ++i) {
+		struct tfmx_softvoice *v = &s->softv[i];
+		v->step_q = (v->period != 0)
+			? (((uint64_t)(uint32_t)cp << 32) / (uint64_t)v->period)
+			: 0;
+	}
+	for(uint32_t k = 0; k < n; ++k) {
+		int32_t sam = 0;
+		for(int32_t i = 0; i < 5; ++i) {
+			struct tfmx_softvoice *v = &s->softv[i];
+			if(!v->active || v->sample == 0 || v->step_q == 0) {
+				continue;
+			}
+			sam += ((int32_t)v->sample[v->pos] * (int32_t)v->volume) / 64;
+			v->step_acc += v->step_q;
+			while(v->step_acc >= ((uint64_t)1 << 32)) {
+				v->step_acc -= ((uint64_t)1 << 32);
+				tfmx_softvoice_advance(v);
+				if(!v->active) {
+					break;
+				}
+			}
+		}
+		if(sam > 127) {
+			sam = 127;
+		}
+		if(sam < -128) {
+			sam = -128;
+		}
+		s->softmix_buf[k] = (int8_t)sam;
+	}
+	paula_play_sample(&s->paula, 3, s->softmix_buf, n);
+	paula_set_loop(&s->paula, 3, 0, n);
+	paula_set_period(&s->paula, 3, (uint16_t)cp);
+	paula_set_volume(&s->paula, 3, 64);
+}
+
 // Hardware shim helpers: thin layer between the TFMX engine and paula.h.
 // These mirror the C# PaulaVoice / IChannel surface used by the port.
 
@@ -460,11 +685,11 @@ static void tfmx_paula_apply_dma(struct tfmx_state *s, struct tfmx_voice_state *
 	}
 	int8_t *sample_ptr = (int8_t *)s->input.buf;
 	if(v->paula_dma_on) {
-		paula_play_sample(&s->paula, (int32_t)v->voice_num, sample_ptr, v->paula_start_offset + length_bytes);
-		paula_set_pos(&s->paula, (int32_t)v->voice_num, v->paula_start_offset);
-		paula_set_loop(&s->paula, (int32_t)v->voice_num, v->paula_start_offset, length_bytes);
-		paula_set_period(&s->paula, (int32_t)v->voice_num, v->paula_period == 0 ? 0x100 : v->paula_period);
-		paula_set_volume(&s->paula, (int32_t)v->voice_num, v->paula_volume > 64 ? 64 : v->paula_volume);
+		tfmx_pch_play_sample(s, (int32_t)v->voice_num, sample_ptr, v->paula_start_offset + length_bytes);
+		tfmx_pch_set_pos(s, (int32_t)v->voice_num, v->paula_start_offset);
+		tfmx_pch_set_loop(s, (int32_t)v->voice_num, v->paula_start_offset, length_bytes);
+		tfmx_pch_set_period(s, (int32_t)v->voice_num, v->paula_period == 0 ? 0x100 : v->paula_period);
+		tfmx_pch_set_volume(s, (int32_t)v->voice_num, v->paula_volume > 64 ? 64 : v->paula_volume);
 	}
 }
 
@@ -481,8 +706,8 @@ static void tfmx_paula_take_next_buf(struct tfmx_state *s, struct tfmx_voice_sta
 	if(!v->paula_dma_on) {
 		return;
 	}
-	paula_queue_sample(&s->paula, (int32_t)v->voice_num, sample_ptr, v->paula_start_offset, length_bytes);
-	paula_set_loop(&s->paula, (int32_t)v->voice_num, v->paula_start_offset, length_bytes);
+	tfmx_pch_queue_sample(s, (int32_t)v->voice_num, sample_ptr, v->paula_start_offset, length_bytes);
+	tfmx_pch_set_loop(s, (int32_t)v->voice_num, v->paula_start_offset, length_bytes);
 }
 
 // [=]===^=[ tfmx_paula_on ]======================================================================[=]
@@ -497,7 +722,7 @@ static void tfmx_paula_off(struct tfmx_state *s, struct tfmx_voice_state *v) {
 	v->paula_period = 0;
 	v->paula_volume = 0;
 	v->paula_loop_count = 0;
-	paula_mute(&s->paula, (int32_t)v->voice_num);
+	tfmx_pch_mute(s, (int32_t)v->voice_num);
 }
 
 // [=]===^=[ tfmx_take_next_buf_checked ]=========================================================[=]
@@ -2098,9 +2323,9 @@ static void tfmx_run(struct tfmx_state *s) {
 	for(v = 0; v < (uint8_t)s->voice_count; ++v) {
 		struct tfmx_voice_state *vs = &s->voices[v];
 		if(vs->paula_dma_on) {
-			paula_set_period(&s->paula, (int32_t)vs->voice_num, vs->paula_period == 0 ? 0x100 : vs->paula_period);
+			tfmx_pch_set_period(s, (int32_t)vs->voice_num, vs->paula_period == 0 ? 0x100 : vs->paula_period);
 			uint16_t vol = vs->paula_volume > 64 ? 64 : vs->paula_volume;
-			paula_set_volume(&s->paula, (int32_t)vs->voice_num, vol);
+			tfmx_pch_set_volume(s, (int32_t)vs->voice_num, vol);
 		}
 		// Track Paula loop count for WaitOnDMA: increment when the channel
 		// has wrapped at least one full length while DMA-on. We approximate
@@ -2270,7 +2495,6 @@ static uint8_t tfmx_detect_naked(uint8_t *buf, uint32_t len) {
 // [=]===^=[ tfmx_init_decoder ]==================================================================[=]
 // Build state from raw input buffer (already loaded into s->input.buf).
 static int32_t tfmx_init_decoder(struct tfmx_state *s) {
-	uint8_t v;
 	uint32_t v_idx;
 
 	for(v_idx = 0; v_idx < TFMX_VOICES_MAX; ++v_idx) {
@@ -2392,13 +2616,10 @@ static int32_t tfmx_init_decoder(struct tfmx_state *s) {
 	s->player_info.admin.start_song = 0;
 	tfmx_restart(s);
 
-	// Apply per-voice panning. Voices 0,3 -> left; 1,2 -> right (matches the
-	// Pan4 table); for 7V, voices 4-6 also pan left.
-	uint8_t pan_left[8] = { 0, 1, 1, 0, 0, 0, 0, 0 };
-	for(v = 0; v < 8; ++v) {
-		s->paula.ch[v].pan = pan_left[v] ? 127 : 0;
-	}
-
+	// Stereo is the fixed Paula wiring: voices 0,3 -> left, 1,2 -> right
+	// (Pan4). In 7V the three hardware voices are 0,1,2 and voices >=3 are
+	// CPU-summed into channel 3 (left), so the image is intrinsic to the
+	// channel assignment -- no per-voice pan field exists any more.
 	return 1;
 }
 
@@ -2418,6 +2639,7 @@ static struct tfmx_state *tfmx_init(void *data, uint32_t len, int32_t sample_rat
 
 	s->sample_rate = sample_rate;
 	paula_init(&s->paula, sample_rate, TFMX_DEFAULT_TICK_HZ);
+	s->softmix_period = TFMX_7V_CH3_PERIOD;
 
 	s->input.buf_len = len;
 	s->input.len = len;
@@ -2447,6 +2669,9 @@ static void tfmx_free(struct tfmx_state *s) {
 	if(s->input.buf) {
 		free(s->input.buf);
 	}
+	if(s->softmix_buf) {
+		free(s->softmix_buf);
+	}
 	free(s);
 }
 
@@ -2463,6 +2688,9 @@ static void tfmx_get_audio(struct tfmx_state *s, float *output, int32_t frames) 
 	while(produced < frames) {
 		if(s->frames_until_tick_fp == 0) {
 			tfmx_run(s);
+			if(s->voice_count >= 7) {
+				tfmx_softmix_refill(s);
+			}
 			s->frames_until_tick_fp = s->frames_per_tick_fp;
 		}
 		uint32_t avail_ticks_fp = s->frames_until_tick_fp;

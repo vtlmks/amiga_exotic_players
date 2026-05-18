@@ -41,6 +41,9 @@
 #endif
 
 #define DBPRO_MAX_TRACKS    254
+// Paula DMA period of the DBM L/R software-mix output. Fidelity-only:
+// each soft voice steps at its own Hz. A/B'd vs UADE DigiBooster Pro.
+#define DBPRO_MIX_PERIOD    320
 #define DBPRO_MAX_INSTR     255
 #define DBPRO_MAX_SAMPLES   256
 #define DBPRO_MAX_PATTERNS  65535
@@ -233,6 +236,28 @@ struct dbpro_track {
 	int32_t panning_env_current;  // -16384..+16384. Set to 0 on trigger.
 };
 
+// DigiBooster Pro (DBM) is a full per-voice PANNED software stereo mixer
+// (2..254 tracks; the original DBM0player.s hands all tracks to AHI's
+// mixer with per-track volume + pan -- the 14-bit Paula pairing is an
+// AHI/output detail, not the DBM data). We reproduce that: every track is
+// a soft voice summed by the CPU into an L/R buffer pair DMA'd through
+// Paula ch0 (L) and ch1 (R). No channel folding (the old i&7 fold was a
+// cheat and caused an out-of-range Paula index on >8-track modules).
+struct dbpro_softvoice {
+	int8_t *sample;
+	uint32_t length;
+	uint32_t loop_start;
+	uint32_t loop_length;          // 0 => one-shot
+	uint32_t pos;
+	uint32_t freq;                 // Hz (DBP pitch math)
+	uint64_t step_q;               // Q32 sample bytes per output sample
+	uint64_t step_acc;
+	uint16_t volume;               // 0..64
+	uint8_t pan;                   // 0=left .. 127=right
+	uint8_t backwards;             // E3 reverse playback
+	uint8_t active;
+};
+
 struct dbpro_state {
 	struct paula paula;
 
@@ -284,6 +309,12 @@ struct dbpro_state {
 	uint8_t arp_counter;
 	uint8_t end_reached;
 	uint8_t restart_song;
+
+	// Full per-voice panned software stereo mix -> Paula ch0 (L) / ch1 (R).
+	struct dbpro_softvoice *softv;  // num_tracks entries
+	int8_t *softmix_buf;            // 2 contiguous n-sized buffers (L, R)
+	uint32_t softmix_cap;
+	int32_t softmix_period;
 };
 
 // Periods used by version 2 modules (DBM2). 8 octaves x 12 notes.
@@ -469,6 +500,10 @@ static void dbpro_free_module(struct dbpro_state *s) {
 		free(s->panning_envelopes);
 		s->panning_envelopes = 0;
 	}
+	free(s->softv);
+	s->softv = 0;
+	free(s->softmix_buf);
+	s->softmix_buf = 0;
 }
 
 // [=]===^=[ dbpro_load_chunk_info ]==============================================================[=]
@@ -1113,8 +1148,6 @@ static void dbpro_init_tracks(struct dbpro_state *s) {
 		mt->panning_env.index = DBPRO_ENV_DISABLED;
 		mt->volume_env_current = 16384;
 		mt->panning_env_current = 0;
-		// LRRL panning, mirroring NostalgicPlayer's default Amiga pan.
-		s->paula.ch[i & 7].pan = (((i & 2) >> 1) ^ (i & 1)) ? 127 : 0;
 	}
 }
 
@@ -1150,25 +1183,166 @@ static void dbpro_reset(struct dbpro_state *s) {
 	dbpro_set_bpm_tempo(s, (uint32_t)s->tempo);
 }
 
-// [=]===^=[ dbpro_set_freq ]=====================================================================[=]
-// DBP's pitch math produces playback frequencies up to ~150 kHz which exceed
-// what the period model in paula.h can represent (PAULA_MIN_PERIOD clamps to
-// ~28.6 kHz). NostalgicPlayer's mixer takes raw Hz, so we do the same.
-static void dbpro_set_freq(struct dbpro_state *s, int32_t channel, uint32_t freq) {
-	if(freq == 0) {
-		paula_mute(&s->paula, channel);
-		return;
+// Every track is a soft voice in the full panned stereo mix. These
+// wrappers, keyed by track index, are the single capture point; the four
+// Paula channels are owned by the submixer (ch0=L, ch1=R).
+// [=]===^=[ dbp_pch_play_sample ]================================================================[=]
+static void dbp_pch_play_sample(struct dbpro_state *s, int32_t t, int8_t *sample, uint32_t length) {
+	struct dbpro_softvoice *v = &s->softv[t];
+	v->sample = sample;
+	v->length = length;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = (v->backwards && length > 0) ? (length - 1) : 0;
+	v->step_acc = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ dbp_pch_set_loop ]===================================================================[=]
+static void dbp_pch_set_loop(struct dbpro_state *s, int32_t t, uint32_t start, uint32_t length) {
+	struct dbpro_softvoice *v = &s->softv[t];
+	v->loop_start = start;
+	v->loop_length = length;
+}
+
+// [=]===^=[ dbp_pch_set_backwards ]==============================================================[=]
+static void dbp_pch_set_backwards(struct dbpro_state *s, int32_t t, int32_t on) {
+	s->softv[t].backwards = on ? 1 : 0;
+}
+
+// [=]===^=[ dbp_pch_set_volume ]=================================================================[=]
+static void dbp_pch_set_volume(struct dbpro_state *s, int32_t t, uint16_t volume) {
+	if(volume > 64) {
+		volume = 64;
 	}
-#ifdef DBPRO_DEBUG_FREQ
-	{
-		static int32_t s_count = 0;
-		if(s_count < 16) {
-			fprintf(stderr, "[dbpro] ch=%d freq=%u\n", channel, (unsigned)freq);
-			s_count++;
+	s->softv[t].volume = volume;
+}
+
+// [=]===^=[ dbp_pch_set_pan ]====================================================================[=]
+static void dbp_pch_set_pan(struct dbpro_state *s, int32_t t, uint8_t pan) {
+	s->softv[t].pan = pan;
+}
+
+// [=]===^=[ dbp_pch_mute ]=======================================================================[=]
+static void dbp_pch_mute(struct dbpro_state *s, int32_t t) {
+	s->softv[t].active = 0;
+}
+
+// [=]===^=[ dbp_softvoice_advance ]==============================================================[=]
+static void dbp_softvoice_advance(struct dbpro_softvoice *v) {
+	if(!v->backwards) {
+		uint32_t np = v->pos + 1;
+		if(np >= v->length) {
+			if(v->loop_length > 0) {
+				uint32_t over = np - v->length;
+				np = v->loop_start + (over % v->loop_length);
+				v->length = v->loop_start + v->loop_length;
+			} else {
+				v->active = 0;
+				return;
+			}
+		}
+		v->pos = np;
+	} else {
+		if(v->pos == 0 || (v->loop_length > 0 && v->pos <= v->loop_start)) {
+			if(v->loop_length > 0) {
+				v->pos = v->loop_start + v->loop_length - 1;
+			} else {
+				v->active = 0;
+				return;
+			}
+		} else {
+			v->pos = v->pos - 1;
 		}
 	}
-#endif
-	paula_set_freq_hz(&s->paula, channel, freq);
+}
+
+// [=]===^=[ dbpro_softmix_refill ]===============================================================[=]
+// Regenerate the L/R mix from all tracks for the next tick and arm Paula
+// ch0 (L) / ch1 (R); ch2/3 muted. Per output sample: sv = sample*vol/64,
+// acc_L += sv*(127-pan)/127, acc_R += sv*pan/127, then clamp each to int8.
+static void dbpro_softmix_refill(struct dbpro_state *s) {
+	int32_t cp = s->softmix_period;
+	uint32_t R = (uint32_t)(s->paula.clock / cp);
+	if(R == 0) {
+		R = 1;
+	}
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)s->paula.samples_per_tick)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	if(n > s->softmix_cap) {
+		uint32_t nc = s->softmix_cap ? s->softmix_cap : 1024;
+		while(nc < n) {
+			nc <<= 1;
+		}
+		int8_t *nb = (int8_t *)realloc(s->softmix_buf, (size_t)nc * 2);
+		if(!nb) {
+			return;
+		}
+		s->softmix_buf = nb;
+		s->softmix_cap = nc;
+	}
+	for(uint32_t i = 0; i < s->num_tracks; ++i) {
+		struct dbpro_softvoice *v = &s->softv[i];
+		v->step_q = (v->freq != 0) ? (((uint64_t)v->freq << 32) / (uint64_t)R) : 0;
+	}
+	int8_t *bl = s->softmix_buf;
+	int8_t *br = s->softmix_buf + s->softmix_cap;
+	for(uint32_t k = 0; k < n; ++k) {
+		int32_t accl = 0;
+		int32_t accr = 0;
+		for(uint32_t i = 0; i < s->num_tracks; ++i) {
+			struct dbpro_softvoice *v = &s->softv[i];
+			if(!v->active || v->sample == 0 || v->step_q == 0) {
+				continue;
+			}
+			int32_t sv = ((int32_t)v->sample[v->pos] * (int32_t)v->volume) / 64;
+			accl += (sv * (int32_t)(127 - v->pan)) / 127;
+			accr += (sv * (int32_t)v->pan) / 127;
+			v->step_acc += v->step_q;
+			while(v->step_acc >= ((uint64_t)1 << 32)) {
+				v->step_acc -= ((uint64_t)1 << 32);
+				dbp_softvoice_advance(v);
+				if(!v->active) {
+					break;
+				}
+			}
+		}
+		if(accl > 127) {
+			accl = 127;
+		}
+		if(accl < -128) {
+			accl = -128;
+		}
+		if(accr > 127) {
+			accr = 127;
+		}
+		if(accr < -128) {
+			accr = -128;
+		}
+		bl[k] = (int8_t)accl;
+		br[k] = (int8_t)accr;
+	}
+	paula_play_sample(&s->paula, 0, bl, n);
+	paula_set_loop(&s->paula, 0, 0, n);
+	paula_set_period(&s->paula, 0, (uint16_t)cp);
+	paula_set_volume(&s->paula, 0, 64);
+	paula_play_sample(&s->paula, 1, br, n);
+	paula_set_loop(&s->paula, 1, 0, n);
+	paula_set_period(&s->paula, 1, (uint16_t)cp);
+	paula_set_volume(&s->paula, 1, 64);
+	paula_mute(&s->paula, 2);
+	paula_mute(&s->paula, 3);
+}
+
+// [=]===^=[ dbpro_set_freq ]=====================================================================[=]
+// DBP pitch math reaches ~150 kHz; the soft voice takes raw Hz.
+static void dbpro_set_freq(struct dbpro_state *s, int32_t channel, uint32_t freq) {
+	if(freq == 0) {
+		dbp_pch_mute(s, channel);
+		return;
+	}
+	s->softv[channel].freq = freq;
 }
 
 // [=]===^=[ dbpro_msynth_pitch ]=================================================================[=]
@@ -1311,15 +1485,15 @@ static void dbpro_msynth_trigger(struct dbpro_state *s, struct dbpro_track *mt, 
 		// DBP effect E3 toggles backwards playback per-track. Apply before
 		// paula_play_sample so the channel seeds pos_fp at the high end of
 		// the buffer.
-		paula_set_backwards(&s->paula, channel, mt->play_backwards ? 1 : 0);
-		paula_play_sample(&s->paula, channel, mt->sample_data + mt->trigger_offset, length);
+		dbp_pch_set_backwards(s, channel, mt->play_backwards ? 1 : 0);
+		dbp_pch_play_sample(s, channel, mt->sample_data + mt->trigger_offset, length);
 		if(mt->sample_loop_length > 0) {
-			paula_set_loop(&s->paula, channel, mt->sample_loop_start, mt->sample_loop_length);
+			dbp_pch_set_loop(s, channel, mt->sample_loop_start, mt->sample_loop_length);
 		} else {
-			paula_set_loop(&s->paula, channel, 0, 0);
+			dbp_pch_set_loop(s, channel, 0, 0);
 		}
 	} else {
-		paula_mute(&s->paula, channel);
+		dbp_pch_mute(s, channel);
 	}
 	mt->vibrato_counter = 0;
 	mt->is_on = 1;
@@ -2170,7 +2344,7 @@ static void dbpro_tick_gains_and_pitch(struct dbpro_state *s) {
 		if(paula_vol < 0) {
 			paula_vol = 0;
 		}
-		paula_set_volume(&s->paula, (int32_t)track, (uint16_t)paula_vol);
+		dbp_pch_set_volume(s, (int32_t)track, (uint16_t)paula_vol);
 		// Map pan -16384..+16384 to 0..127.
 		int32_t pan_127 = (pan + 16384) >> 8;                  // 0..128
 		if(pan_127 > 127) {
@@ -2179,9 +2353,9 @@ static void dbpro_tick_gains_and_pitch(struct dbpro_state *s) {
 		if(pan_127 < 0) {
 			pan_127 = 0;
 		}
-		s->paula.ch[track & 7].pan = (uint8_t)pan_127;
+		dbp_pch_set_pan(s, (int32_t)track, (uint8_t)pan_127);
 		if(!mt->is_on) {
-			paula_mute(&s->paula, (int32_t)track);
+			dbp_pch_mute(s, (int32_t)track);
 		}
 	}
 }
@@ -2230,7 +2404,7 @@ static void dbpro_handle_end(struct dbpro_state *s) {
 	} else {
 		if(s->global_volume == 0) {
 			for(uint32_t track = 0; track < s->num_tracks; ++track) {
-				paula_mute(&s->paula, (int32_t)track);
+				dbp_pch_mute(s, (int32_t)track);
 			}
 		}
 		s->global_volume = 64;
@@ -2242,7 +2416,7 @@ static void dbpro_tick(struct dbpro_state *s) {
 	dbpro_next_tick(s);
 	for(uint32_t track = 0; track < s->num_tracks; ++track) {
 		if(!s->tracks[track].is_on) {
-			paula_mute(&s->paula, (int32_t)track);
+			dbp_pch_mute(s, (int32_t)track);
 		}
 	}
 	dbpro_handle_end(s);
@@ -2267,7 +2441,15 @@ static struct dbpro_state *digiboosterpro_init(void *data, uint32_t len, int32_t
 	// DBM uses BPM-driven ticks, so use a placeholder tick rate; tempo set
 	// directly afterwards.
 	paula_init(&s->paula, sample_rate, 50);
+	s->softmix_period = DBPRO_MIX_PERIOD;
+	s->softv = (struct dbpro_softvoice *)calloc(s->num_tracks, sizeof(struct dbpro_softvoice));
+	if(!s->softv) {
+		dbpro_free_module(s);
+		free(s);
+		return 0;
+	}
 	dbpro_reset(s);
+	dbpro_softmix_refill(s);
 	return s;
 }
 
@@ -2294,6 +2476,7 @@ static void digiboosterpro_get_audio(struct dbpro_state *s, float *output, int32
 		if(s->paula.tick_offset >= s->paula.samples_per_tick) {
 			s->paula.tick_offset = 0;
 			dbpro_tick(s);
+			dbpro_softmix_refill(s);
 		}
 	}
 }

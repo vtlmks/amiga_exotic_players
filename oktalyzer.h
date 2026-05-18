@@ -18,6 +18,9 @@
 #include "player_api.h"
 
 #define OKTALYZER_TICK_HZ      50
+// Paula DMA period of a mixed base channel's CPU submix. Fidelity-only:
+// each soft voice steps at its own pitch. A/B'd against UADE Oktalyzer.
+#define OKTALYZER_MIX_PERIOD   320
 #define OKTALYZER_MAX_CHANNELS 8
 #define OKTALYZER_MAX_PATTERNS 256
 #define OKTALYZER_PATTERN_TABLE_LEN 128
@@ -37,12 +40,6 @@ static int8_t oktalyzer_arp10[16] = {
 // [=]===^=[ oktalyzer_arp12 ]=====================================================================[=]
 static int8_t oktalyzer_arp12[16] = {
 	0, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3
-};
-
-// LRRL panning matching the C# Tables.PanPos (Left, Left, Right, Right, Right, Right, Left, Left).
-// [=]===^=[ oktalyzer_pan_table ]=================================================================[=]
-static uint8_t oktalyzer_pan_table[8] = {
-	0, 0, 127, 127, 127, 127, 0, 0
 };
 
 struct oktalyzer_pattern_line {
@@ -74,6 +71,28 @@ struct oktalyzer_channel_info {
 	uint32_t release_length;
 };
 
+// Oktalyzer Split soft voice. Oktalyzer has four Paula channels; a channel
+// flagged "mixed" carries two logical voices the CPU sums into it (the
+// classic 2-voices-per-channel split, with its volume/quality loss).
+// Unflagged channels play one voice directly on the hardware path. Stereo
+// is the fixed Paula wiring of the four base channels.
+struct oktalyzer_softvoice {
+	int8_t *sample;
+	uint32_t length;
+	uint32_t loop_start;
+	uint32_t loop_length;          // 0 => one-shot
+	uint32_t pos;
+	uint32_t period;
+	uint64_t step_q;               // Q32 sample bytes per output sample
+	uint64_t step_acc;
+	int8_t *pending_sample;
+	uint32_t pending_pos;
+	uint32_t pending_length;
+	uint16_t volume;               // 0..64
+	uint8_t has_pending;
+	uint8_t active;
+};
+
 struct oktalyzer_state {
 	struct paula paula;
 
@@ -100,6 +119,12 @@ struct oktalyzer_state {
 	struct oktalyzer_pattern_line curr_line[OKTALYZER_MAX_CHANNELS];
 	struct oktalyzer_channel_info chan_info[OKTALYZER_MAX_CHANNELS];
 	int8_t chan_vol[OKTALYZER_MAX_CHANNELS];
+
+	// Split submixer: one CPU-summed buffer per "mixed" base channel.
+	struct oktalyzer_softvoice softv[OKTALYZER_MAX_CHANNELS]; // by logical ch
+	int8_t *softmix_buf[4];        // by base Paula channel (mixed bases only)
+	uint32_t softmix_cap[4];
+	int32_t softmix_period;
 };
 
 // [=]===^=[ oktalyzer_read_u32_be ]===============================================================[=]
@@ -130,6 +155,10 @@ static void oktalyzer_cleanup(struct oktalyzer_state *s) {
 		}
 		free(s->samples);
 		s->samples = 0;
+	}
+	for(int32_t i = 0; i < 4; ++i) {
+		free(s->softmix_buf[i]);
+		s->softmix_buf[i] = 0;
 	}
 }
 
@@ -350,7 +379,6 @@ static void oktalyzer_initialize_sound(struct oktalyzer_state *s, int32_t start_
 
 	// Build the channel index table and pan the virtual channels.
 	for(int32_t i = 0, pan_num = 0; i < s->chan_num; ++i, ++pan_num) {
-		s->paula.ch[i].pan = oktalyzer_pan_table[pan_num];
 		s->chan_index[i] = (uint8_t)(pan_num / 2);
 		if(!s->channel_flags[pan_num / 2]) {
 			pan_num++;
@@ -384,6 +412,187 @@ static void oktalyzer_find_next_pattern_line(struct oktalyzer_state *s) {
 	}
 }
 
+// Routing: a logical channel maps to a base Paula channel via chan_index.
+// If that base is "mixed", the logical voice is a soft voice (the base is
+// the CPU sum of its <=2 logical voices); otherwise it plays directly on
+// the real base channel. These wrappers are the single routing point.
+// [=]===^=[ okt_base ]===========================================================================[=]
+static int32_t okt_base(struct oktalyzer_state *s, uint32_t ch) {
+	return (int32_t)s->chan_index[ch];
+}
+
+// [=]===^=[ okt_is_soft ]========================================================================[=]
+static int32_t okt_is_soft(struct oktalyzer_state *s, uint32_t ch) {
+	return s->channel_flags[s->chan_index[ch]] != 0;
+}
+
+// [=]===^=[ okt_pch_play_sample ]================================================================[=]
+static void okt_pch_play_sample(struct oktalyzer_state *s, uint32_t ch, int8_t *sample, uint32_t length) {
+	if(!okt_is_soft(s, ch)) {
+		paula_play_sample(&s->paula, okt_base(s, ch), sample, length);
+		return;
+	}
+	struct oktalyzer_softvoice *v = &s->softv[ch];
+	v->sample = sample;
+	v->length = length;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = 0;
+	v->step_acc = 0;
+	v->has_pending = 0;
+	v->pending_sample = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ okt_pch_queue_sample ]===============================================================[=]
+static void okt_pch_queue_sample(struct oktalyzer_state *s, uint32_t ch, int8_t *sample, uint32_t start_offset, uint32_t length) {
+	if(!okt_is_soft(s, ch)) {
+		paula_queue_sample(&s->paula, okt_base(s, ch), sample, start_offset, length);
+		return;
+	}
+	struct oktalyzer_softvoice *v = &s->softv[ch];
+	if(!v->active && sample != 0 && length > 0) {
+		v->sample = sample;
+		v->pos = start_offset;
+		v->length = start_offset + length;
+		v->step_acc = 0;
+		v->has_pending = 0;
+		v->pending_sample = 0;
+		v->active = 1;
+		return;
+	}
+	v->pending_sample = sample;
+	v->pending_pos = start_offset;
+	v->pending_length = start_offset + length;
+	v->has_pending = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ okt_pch_set_loop ]===================================================================[=]
+static void okt_pch_set_loop(struct oktalyzer_state *s, uint32_t ch, uint32_t start, uint32_t length) {
+	if(!okt_is_soft(s, ch)) {
+		paula_set_loop(&s->paula, okt_base(s, ch), start, length);
+		return;
+	}
+	struct oktalyzer_softvoice *v = &s->softv[ch];
+	v->loop_start = start;
+	v->loop_length = length;
+}
+
+// [=]===^=[ okt_pch_set_period ]=================================================================[=]
+static void okt_pch_set_period(struct oktalyzer_state *s, uint32_t ch, uint16_t period) {
+	if(!okt_is_soft(s, ch)) {
+		paula_set_period(&s->paula, okt_base(s, ch), period);
+		return;
+	}
+	s->softv[ch].period = period;
+}
+
+// [=]===^=[ okt_pch_set_volume ]=================================================================[=]
+static void okt_pch_set_volume(struct oktalyzer_state *s, uint32_t ch, uint16_t volume) {
+	if(!okt_is_soft(s, ch)) {
+		paula_set_volume(&s->paula, okt_base(s, ch), volume);
+		return;
+	}
+	if(volume > 64) {
+		volume = 64;
+	}
+	s->softv[ch].volume = volume;
+}
+
+// [=]===^=[ okt_softvoice_advance ]==============================================================[=]
+static void okt_softvoice_advance(struct oktalyzer_softvoice *v) {
+	uint32_t np = v->pos + 1;
+	if(np >= v->length) {
+		if(v->has_pending) {
+			v->sample = v->pending_sample;
+			np = v->pending_pos;
+			v->length = v->pending_length;
+			v->has_pending = 0;
+			v->pending_sample = 0;
+		} else if(v->loop_length > 0) {
+			uint32_t over = np - v->length;
+			np = v->loop_start + (over % v->loop_length);
+			v->length = v->loop_start + v->loop_length;
+		} else {
+			v->active = 0;
+			return;
+		}
+	}
+	v->pos = np;
+}
+
+// [=]===^=[ oktalyzer_softmix_refill ]===========================================================[=]
+// For every "mixed" base channel, regenerate its CPU-summed DMA buffer from
+// the (<=2) logical voices that map to it and arm that real Paula channel.
+// Sum law mirrors the other Split/hybrid players: per output sample, sum
+// (int8 sample * volume / 64) of the voices, hard-clamp the total to int8.
+static void oktalyzer_softmix_refill(struct oktalyzer_state *s) {
+	int32_t cp = s->softmix_period;
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)s->paula.samples_per_tick)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	for(int32_t i = 0; i < OKTALYZER_MAX_CHANNELS; ++i) {
+		struct oktalyzer_softvoice *v = &s->softv[i];
+		v->step_q = (v->period != 0)
+			? (((uint64_t)(uint32_t)cp << 32) / (uint64_t)v->period)
+			: 0;
+	}
+	for(int32_t b = 0; b < 4; ++b) {
+		if(!s->channel_flags[b]) {
+			continue;
+		}
+		if(n > s->softmix_cap[b]) {
+			uint32_t nc = s->softmix_cap[b] ? s->softmix_cap[b] : 1024;
+			while(nc < n) {
+				nc <<= 1;
+			}
+			int8_t *nb = (int8_t *)realloc(s->softmix_buf[b], nc);
+			if(!nb) {
+				continue;
+			}
+			s->softmix_buf[b] = nb;
+			s->softmix_cap[b] = nc;
+		}
+		int8_t *buf = s->softmix_buf[b];
+		for(uint32_t k = 0; k < n; ++k) {
+			int32_t sam = 0;
+			for(int32_t i = 0; i < OKTALYZER_MAX_CHANNELS; ++i) {
+				if((int32_t)s->chan_index[i] != b) {
+					continue;
+				}
+				struct oktalyzer_softvoice *v = &s->softv[i];
+				if(!v->active || v->sample == 0 || v->step_q == 0) {
+					continue;
+				}
+				// Split volume halving: a mixed base sums two voices into one
+				// Paula channel at half level each, so the pair cannot exceed
+				// single-channel full scale -- the authentic Oktalyzer "mixed"
+				// quality loss, audible and intended.
+				sam += ((int32_t)v->sample[v->pos] * (int32_t)v->volume) / 128;
+				v->step_acc += v->step_q;
+				while(v->step_acc >= ((uint64_t)1 << 32)) {
+					v->step_acc -= ((uint64_t)1 << 32);
+					okt_softvoice_advance(v);
+					if(!v->active) {
+						break;
+					}
+				}
+			}
+			if(sam > 127) {
+				sam = 127;
+			}
+			if(sam < -128) {
+				sam = -128;
+			}
+			buf[k] = (int8_t)sam;
+		}
+		paula_play_sample(&s->paula, b, buf, n);
+		paula_set_loop(&s->paula, b, 0, n);
+		paula_set_period(&s->paula, b, (uint16_t)cp);
+		paula_set_volume(&s->paula, b, 64);
+	}
+}
+
 // [=]===^=[ oktalyzer_play_channel ]==============================================================[=]
 static void oktalyzer_play_channel(struct oktalyzer_state *s, uint32_t channel_num) {
 	struct oktalyzer_pattern_line *patt_data = &s->curr_line[channel_num];
@@ -410,7 +619,7 @@ static void oktalyzer_play_channel(struct oktalyzer_state *s, uint32_t channel_n
 		if(samp->mode == 1) {
 			return;
 		}
-		paula_play_sample(&s->paula, (int32_t)channel_num, samp->sample_data, samp->length);
+		okt_pch_play_sample(s, channel_num, samp->sample_data, samp->length);
 		chan_data->release_start = 0;
 		chan_data->release_length = 0;
 	} else {
@@ -421,13 +630,13 @@ static void oktalyzer_play_channel(struct oktalyzer_state *s, uint32_t channel_n
 		s->chan_vol[s->chan_index[channel_num]] = (int8_t)samp->volume;
 
 		if(samp->repeat_length == 0) {
-			paula_play_sample(&s->paula, (int32_t)channel_num, samp->sample_data, samp->length);
+			okt_pch_play_sample(s, channel_num, samp->sample_data, samp->length);
 			chan_data->release_start = 0;
 			chan_data->release_length = 0;
 		} else {
 			uint32_t play_len = (uint32_t)samp->repeat_start + (uint32_t)samp->repeat_length;
-			paula_play_sample(&s->paula, (int32_t)channel_num, samp->sample_data, play_len);
-			paula_set_loop(&s->paula, (int32_t)channel_num, samp->repeat_start, samp->repeat_length);
+			okt_pch_play_sample(s, channel_num, samp->sample_data, play_len);
+			okt_pch_set_loop(s, channel_num, samp->repeat_start, samp->repeat_length);
 			chan_data->release_start = play_len;
 			chan_data->release_length = (samp->length > play_len) ? (samp->length - play_len) : 0;
 		}
@@ -435,7 +644,7 @@ static void oktalyzer_play_channel(struct oktalyzer_state *s, uint32_t channel_n
 
 	chan_data->curr_note = note;
 	chan_data->curr_period = oktalyzer_periods[note];
-	paula_set_period(&s->paula, (int32_t)channel_num, (uint16_t)chan_data->curr_period);
+	okt_pch_set_period(s, channel_num, (uint16_t)chan_data->curr_period);
 }
 
 // [=]===^=[ oktalyzer_play_pattern_line ]=========================================================[=]
@@ -457,7 +666,7 @@ static void oktalyzer_play_note(struct oktalyzer_state *s, uint32_t channel_num,
 		note = 35;
 	}
 	chan_data->curr_period = oktalyzer_periods[note];
-	paula_set_period(&s->paula, (int32_t)channel_num, (uint16_t)chan_data->curr_period);
+	okt_pch_set_period(s, channel_num, (uint16_t)chan_data->curr_period);
 }
 
 // [=]===^=[ oktalyzer_do_channel_effect ]=========================================================[=]
@@ -477,7 +686,7 @@ static void oktalyzer_do_channel_effect(struct oktalyzer_state *s, uint32_t chan
 			if(chan_data->curr_period < 113) {
 				chan_data->curr_period = 113;
 			}
-			paula_set_period(&s->paula, (int32_t)channel_num, (uint16_t)chan_data->curr_period);
+			okt_pch_set_period(s, channel_num, (uint16_t)chan_data->curr_period);
 			break;
 		}
 
@@ -487,7 +696,7 @@ static void oktalyzer_do_channel_effect(struct oktalyzer_state *s, uint32_t chan
 			if(chan_data->curr_period > 856) {
 				chan_data->curr_period = 856;
 			}
-			paula_set_period(&s->paula, (int32_t)channel_num, (uint16_t)chan_data->curr_period);
+			okt_pch_set_period(s, channel_num, (uint16_t)chan_data->curr_period);
 			break;
 		}
 
@@ -600,8 +809,8 @@ static void oktalyzer_do_channel_effect(struct oktalyzer_state *s, uint32_t chan
 				struct oktalyzer_sample *samp = (patt_data->sample_num < s->samp_num) ? &s->samples[patt_data->sample_num] : 0;
 				// SetSample takes effect via Paula's pending-buffer mechanism on next wrap.
 				if(samp && samp->sample_data) {
-					paula_queue_sample(&s->paula, (int32_t)channel_num, samp->sample_data, chan_data->release_start, chan_data->release_length);
-					paula_set_loop(&s->paula, (int32_t)channel_num, chan_data->release_start, chan_data->release_length);
+					okt_pch_queue_sample(s, channel_num, samp->sample_data, chan_data->release_start, chan_data->release_length);
+					okt_pch_set_loop(s, channel_num, chan_data->release_start, chan_data->release_length);
 				}
 			}
 			break;
@@ -689,10 +898,10 @@ static void oktalyzer_set_volumes(struct oktalyzer_state *s) {
 	s->chan_vol[7] = s->chan_vol[3];
 
 	for(uint32_t i = 0, j = 0; i < 4; ++i, ++j) {
-		paula_set_volume(&s->paula, (int32_t)j, (uint16_t)(uint8_t)s->chan_vol[i]);
+		okt_pch_set_volume(s, j, (uint16_t)(uint8_t)s->chan_vol[i]);
 		if(s->channel_flags[i]) {
 			++j;
-			paula_set_volume(&s->paula, (int32_t)j, (uint16_t)(uint8_t)s->chan_vol[i]);
+			okt_pch_set_volume(s, j, (uint16_t)(uint8_t)s->chan_vol[i]);
 		}
 	}
 }
@@ -728,7 +937,9 @@ static struct oktalyzer_state *oktalyzer_init(void *data, uint32_t len, int32_t 
 	}
 
 	paula_init(&s->paula, sample_rate, OKTALYZER_TICK_HZ);
+	s->softmix_period = OKTALYZER_MIX_PERIOD;
 	oktalyzer_initialize_sound(s, 0);
+	oktalyzer_softmix_refill(s);
 	return s;
 }
 
@@ -755,6 +966,7 @@ static void oktalyzer_get_audio(struct oktalyzer_state *s, float *output, int32_
 		if(s->paula.tick_offset >= s->paula.samples_per_tick) {
 			s->paula.tick_offset = 0;
 			oktalyzer_tick(s);
+			oktalyzer_softmix_refill(s);
 		}
 	}
 }

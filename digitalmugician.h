@@ -20,6 +20,10 @@
 #include "player_api.h"
 
 #define DMU_TICK_HZ           50
+// Paula DMA period of the DMU2 L/R software-mix output. Fidelity-only:
+// each soft voice steps at its own pitch, so this does not move pitch.
+// A/B'd against UADE's Mugician II.
+#define DMU2_MIX_PERIOD       320
 #define DMU_PERIOD_START      7
 #define DMU_NUM_PERIODS       (16 * 64 + 7)
 #define DMU_WAVEFORM_SIZE     128
@@ -134,6 +138,29 @@ struct dmu_voice_info {
 	uint8_t instrument_effect_speed;
 };
 
+// Full-software-stereo-mix soft voice. Digital Mugician II is a 7-voice
+// software mixer: every voice is summed by the CPU with a per-voice pan
+// into a stereo buffer pair, then that pair is DMA'd through two Paula
+// channels (no channel splitting -> no OctaMED-style quality loss). DMU1
+// is a plain 4-channel format and stays on the real hardware path.
+struct dmu_softvoice {
+	int8_t *sample;
+	uint32_t length;
+	uint32_t loop_start;
+	uint32_t loop_length;          // 0 => one-shot
+	uint32_t pos;
+	uint32_t period;               // Paula period (pitch)
+	uint64_t step_q;               // sample bytes per output sample, Q32
+	uint64_t step_acc;
+	int8_t *pending_sample;
+	uint32_t pending_pos;
+	uint32_t pending_length;
+	uint16_t volume;               // 0..64
+	uint8_t pan;                   // 0=left .. 127=right
+	uint8_t has_pending;
+	uint8_t active;
+};
+
 struct digitalmugician_state {
 	struct paula paula;
 
@@ -187,6 +214,14 @@ struct digitalmugician_state {
 	int32_t ch_tab_index;
 
 	uint8_t end_reached;
+
+	// DMU2 full-software stereo submixer (7 voices -> L/R buffers ->
+	// Paula ch0 (L) and ch1 (R)). Unused for DMU1.
+	struct dmu_softvoice softv[7];
+	int8_t *softmix_l;
+	int8_t *softmix_r;
+	uint32_t softmix_cap;
+	int32_t softmix_period;
 };
 
 // [=]===^=[ dmu_periods ]========================================================================[=]
@@ -318,6 +353,8 @@ static void dmu_cleanup(struct digitalmugician_state *s) {
 	free(s->waveforms); s->waveforms = 0;
 	free(s->samples); s->samples = 0;
 	free(s->sample_pool); s->sample_pool = 0;
+	free(s->softmix_l); s->softmix_l = 0;
+	free(s->softmix_r); s->softmix_r = 0;
 }
 
 // [=]===^=[ dmu_identify ]=======================================================================[=]
@@ -601,13 +638,193 @@ static void dmu_dispatch_inst_effect(struct digitalmugician_state *s, int8_t *wa
 	}
 }
 
+// DMU2 routes every voice through the software submixer; DMU1 keeps the
+// real hardware path. These wrappers are the single routing point.
+// [=]===^=[ dmu_is_soft ]========================================================================[=]
+static int32_t dmu_is_soft(struct digitalmugician_state *s) {
+	return s->module_type == DMU_TYPE_DMU2;
+}
+
+// [=]===^=[ dmu_pch_play_sample ]================================================================[=]
+static void dmu_pch_play_sample(struct digitalmugician_state *s, int32_t ch, int8_t *sample, uint32_t length) {
+	if(!dmu_is_soft(s)) {
+		paula_play_sample(&s->paula, ch, sample, length);
+		return;
+	}
+	struct dmu_softvoice *v = &s->softv[ch];
+	v->sample = sample;
+	v->length = length;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = 0;
+	v->step_acc = 0;
+	v->has_pending = 0;
+	v->pending_sample = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ dmu_pch_queue_sample ]===============================================================[=]
+static void dmu_pch_queue_sample(struct digitalmugician_state *s, int32_t ch, int8_t *sample, uint32_t start_offset, uint32_t length) {
+	if(!dmu_is_soft(s)) {
+		paula_queue_sample(&s->paula, ch, sample, start_offset, length);
+		return;
+	}
+	struct dmu_softvoice *v = &s->softv[ch];
+	if(!v->active && sample != 0 && length > 0) {
+		v->sample = sample;
+		v->pos = start_offset;
+		v->length = start_offset + length;
+		v->step_acc = 0;
+		v->has_pending = 0;
+		v->pending_sample = 0;
+		v->active = 1;
+		return;
+	}
+	v->pending_sample = sample;
+	v->pending_pos = start_offset;
+	v->pending_length = start_offset + length;
+	v->has_pending = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ dmu_pch_set_loop ]===================================================================[=]
+static void dmu_pch_set_loop(struct digitalmugician_state *s, int32_t ch, uint32_t start, uint32_t length) {
+	if(!dmu_is_soft(s)) {
+		paula_set_loop(&s->paula, ch, start, length);
+		return;
+	}
+	struct dmu_softvoice *v = &s->softv[ch];
+	v->loop_start = start;
+	v->loop_length = length;
+}
+
+// [=]===^=[ dmu_pch_set_period ]=================================================================[=]
+static void dmu_pch_set_period(struct digitalmugician_state *s, int32_t ch, uint16_t period) {
+	if(!dmu_is_soft(s)) {
+		paula_set_period(&s->paula, ch, period);
+		return;
+	}
+	s->softv[ch].period = period;
+}
+
+// [=]===^=[ dmu_pch_set_volume ]=================================================================[=]
+static void dmu_pch_set_volume(struct digitalmugician_state *s, int32_t ch, uint16_t volume) {
+	if(!dmu_is_soft(s)) {
+		paula_set_volume(&s->paula, ch, volume);
+		return;
+	}
+	if(volume > 64) {
+		volume = 64;
+	}
+	s->softv[ch].volume = volume;
+}
+
+// [=]===^=[ dmu_softvoice_advance ]==============================================================[=]
+static void dmu_softvoice_advance(struct dmu_softvoice *v) {
+	uint32_t np = v->pos + 1;
+	if(np >= v->length) {
+		if(v->has_pending) {
+			v->sample = v->pending_sample;
+			np = v->pending_pos;
+			v->length = v->pending_length;
+			v->has_pending = 0;
+			v->pending_sample = 0;
+		} else if(v->loop_length > 0) {
+			uint32_t over = np - v->length;
+			np = v->loop_start + (over % v->loop_length);
+			v->length = v->loop_start + v->loop_length;
+		} else {
+			v->active = 0;
+			return;
+		}
+	}
+	v->pos = np;
+}
+
+// [=]===^=[ dmu_softmix_refill ]=================================================================[=]
+// DMU2: regenerate the L/R software-mix buffers from the 7 voices for the
+// next player tick and arm Paula ch0 (left) and ch1 (right). Per output
+// sample: acc_L += s*vol*(127-pan), acc_R += s*vol*pan, then normalise to
+// int8 and hard-clamp. Per-voice volume/pan are baked in, so ch0/ch1 run
+// at full volume; ch2/ch3 stay muted. Pan law is energy-preserving so the
+// mono sum (and thus pitch/level) is pan-independent.
+static void dmu_softmix_refill(struct digitalmugician_state *s) {
+	int32_t cp = s->softmix_period;
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)s->paula.samples_per_tick)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	if(n > s->softmix_cap) {
+		uint32_t nc = s->softmix_cap ? s->softmix_cap : 1024;
+		while(nc < n) {
+			nc <<= 1;
+		}
+		int8_t *bl = (int8_t *)realloc(s->softmix_l, nc);
+		int8_t *br = (int8_t *)realloc(s->softmix_r, nc);
+		if(!bl || !br) {
+			return;
+		}
+		s->softmix_l = bl;
+		s->softmix_r = br;
+		s->softmix_cap = nc;
+	}
+	for(int32_t i = 0; i < 7; ++i) {
+		struct dmu_softvoice *v = &s->softv[i];
+		v->step_q = (v->period != 0)
+			? (((uint64_t)(uint32_t)cp << 32) / (uint64_t)v->period)
+			: 0;
+	}
+	for(uint32_t k = 0; k < n; ++k) {
+		int32_t accl = 0;
+		int32_t accr = 0;
+		for(int32_t i = 0; i < 7; ++i) {
+			struct dmu_softvoice *v = &s->softv[i];
+			if(!v->active || v->sample == 0 || v->step_q == 0) {
+				continue;
+			}
+			int32_t sv = (int32_t)v->sample[v->pos] * (int32_t)v->volume;
+			accl += (sv * (int32_t)(127 - v->pan)) / 127;
+			accr += (sv * (int32_t)v->pan) / 127;
+			v->step_acc += v->step_q;
+			while(v->step_acc >= ((uint64_t)1 << 32)) {
+				v->step_acc -= ((uint64_t)1 << 32);
+				dmu_softvoice_advance(v);
+				if(!v->active) {
+					break;
+				}
+			}
+		}
+		accl /= 64;
+		accr /= 64;
+		if(accl > 127) {
+			accl = 127;
+		}
+		if(accl < -128) {
+			accl = -128;
+		}
+		if(accr > 127) {
+			accr = 127;
+		}
+		if(accr < -128) {
+			accr = -128;
+		}
+		s->softmix_l[k] = (int8_t)accl;
+		s->softmix_r[k] = (int8_t)accr;
+	}
+	paula_play_sample(&s->paula, 0, s->softmix_l, n);
+	paula_set_loop(&s->paula, 0, 0, n);
+	paula_set_period(&s->paula, 0, (uint16_t)cp);
+	paula_set_volume(&s->paula, 0, 64);
+	paula_play_sample(&s->paula, 1, s->softmix_r, n);
+	paula_set_loop(&s->paula, 1, 0, n);
+	paula_set_period(&s->paula, 1, (uint16_t)cp);
+	paula_set_volume(&s->paula, 1, 64);
+	paula_mute(&s->paula, 2);
+	paula_mute(&s->paula, 3);
+}
+
 // [=]===^=[ dmu_play_note ]======================================================================[=]
 static void dmu_play_note(struct digitalmugician_state *s, int32_t channel_number) {
 	struct dmu_voice_info *voice = &s->voice_info[channel_number];
 	int32_t paula_ch = channel_number;
-	if(paula_ch >= PAULA_NUM_CHANNELS) {
-		paula_ch = PAULA_NUM_CHANNELS - 1;
-	}
 
 	if(s->new_pattern) {
 		struct dmu_sequence *seq;
@@ -658,18 +875,18 @@ static void dmu_play_note(struct digitalmugician_state *s, int32_t channel_numbe
 				if(voice->last_effect != DMU_EFF_NO_WANDER) {
 					if(waveform >= 32) {
 						struct dmu_sample *sample = &s->samples[waveform - 32];
-						paula_play_sample(&s->paula, paula_ch, sample->data, sample->length);
+						dmu_pch_play_sample(s, paula_ch, sample->data, sample->length);
 						if(sample->loop_start >= 0) {
-							paula_set_loop(&s->paula, paula_ch, (uint32_t)sample->loop_start, sample->length - (uint32_t)sample->loop_start);
+							dmu_pch_set_loop(s, paula_ch, (uint32_t)sample->loop_start, sample->length - (uint32_t)sample->loop_start);
 						}
 					} else {
 						int8_t *wavedata = s->waveforms[waveform];
 						if(voice->last_effect != DMU_EFF_NO_DMA) {
-							paula_play_sample(&s->paula, paula_ch, wavedata, inst->loop_length);
+							dmu_pch_play_sample(s, paula_ch, wavedata, inst->loop_length);
 						} else {
-							paula_queue_sample(&s->paula, paula_ch, wavedata, 0, inst->loop_length);
+							dmu_pch_queue_sample(s, paula_ch, wavedata, 0, inst->loop_length);
 						}
-						paula_set_loop(&s->paula, paula_ch, 0, inst->loop_length);
+						dmu_pch_set_loop(s, paula_ch, 0, inst->loop_length);
 
 						if(s->module_type == DMU_TYPE_DMU1) {
 							if((inst->effect != DMU_INSTEFF_NONE) && (voice->last_effect != DMU_EFF_NO_INSTRUMENT_EFFECT) && (voice->last_effect != DMU_EFF_NO_INSTRUMENT_EFFECT_AND_VOLUME)) {
@@ -738,9 +955,6 @@ static void dmu_play_note(struct digitalmugician_state *s, int32_t channel_numbe
 static void dmu_do_effects(struct digitalmugician_state *s, int32_t channel_number) {
 	struct dmu_voice_info *voice = &s->voice_info[channel_number];
 	int32_t paula_ch = channel_number;
-	if(paula_ch >= PAULA_NUM_CHANNELS) {
-		paula_ch = PAULA_NUM_CHANNELS - 1;
-	}
 
 	if(voice->last_instrument < s->number_of_instruments) {
 		struct dmu_instrument *inst = &s->instruments[voice->last_instrument];
@@ -773,7 +987,7 @@ static void dmu_do_effects(struct digitalmugician_state *s, int32_t channel_numb
 					int32_t raw = (int32_t)s->waveforms[inst->volume][voice->volume_index];
 					int32_t volume = -(int32_t)(int8_t)(raw + 0x81);
 					volume = (volume & 0xff) / 4;
-					paula_set_volume(&s->paula, paula_ch, (uint16_t)volume);
+					dmu_pch_set_volume(s, paula_ch, (uint16_t)volume);
 				}
 			}
 		}
@@ -824,7 +1038,7 @@ static void dmu_do_effects(struct digitalmugician_state *s, int32_t channel_numb
 			}
 		}
 
-		paula_set_period(&s->paula, paula_ch, voice->note_period);
+		dmu_pch_set_period(s, paula_ch, voice->note_period);
 	}
 }
 
@@ -1171,14 +1385,20 @@ static struct digitalmugician_state *digitalmugician_init(void *data, uint32_t l
 	paula_init(&s->paula, sample_rate, DMU_TICK_HZ);
 
 	if(s->module_type == DMU_TYPE_DMU2) {
-		// Hard-pan the four mix channels (DMU2 folds 7 voices into 4 Paula channels).
-		s->paula.ch[0].pan = 0;
-		s->paula.ch[1].pan = 127;
-		s->paula.ch[2].pan = 127;
-		s->paula.ch[3].pan = 0;
+		// Per-voice stereo image for the software mix (LRRL spread,
+		// extended to 7 voices). Energy-preserving, so the mono sum
+		// used for A/B is pan-independent.
+		static const uint8_t dmu2_pan[7] = { 0, 127, 127, 0, 0, 127, 127 };
+		for(int32_t i = 0; i < 7; ++i) {
+			s->softv[i].pan = dmu2_pan[i];
+		}
+		s->softmix_period = DMU2_MIX_PERIOD;
 	}
 
 	dmu_initialize_sound(s, 0);
+	if(s->module_type == DMU_TYPE_DMU2) {
+		dmu_softmix_refill(s);
+	}
 	return s;
 }
 
@@ -1205,6 +1425,9 @@ static void digitalmugician_get_audio(struct digitalmugician_state *s, float *ou
 		if(s->paula.tick_offset >= s->paula.samples_per_tick) {
 			s->paula.tick_offset = 0;
 			dmu_play_it(s);
+			if(s->module_type == DMU_TYPE_DMU2) {
+				dmu_softmix_refill(s);
+			}
 		}
 	}
 }

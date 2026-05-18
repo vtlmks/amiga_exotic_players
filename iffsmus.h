@@ -27,7 +27,10 @@
 #include "paula.h"
 #include "player_api.h"
 
-#define IFFSMUS_MAX_CHANNELS   PAULA_NUM_CHANNELS
+// IFF-SMUS on the Amiga is a 4-track format: the Sonix-lineage player maps
+// the score's tracks 1:1 onto Paula's four hard-panned channels (0+3 left,
+// 1+2 right). Tracks beyond four are not played, exactly as on hardware.
+#define IFFSMUS_MAX_CHANNELS   4
 #define IFFSMUS_MAX_INSTR      256
 #define IFFSMUS_INSTR_NAME_LEN 64
 #define IFFSMUS_CIA_FREQ       709379u            // PAL CIA-A timer base

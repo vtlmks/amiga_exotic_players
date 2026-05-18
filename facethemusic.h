@@ -24,6 +24,9 @@
 #define FTM_NUM_TRACKS         8
 #define FTM_NUM_LFO            4
 #define FTM_PAL_CLOCK          3546895U
+// Paula DMA period of a Split base channel's CPU submix. Fidelity-only:
+// each soft voice steps at its own Hz. A/B'd against UADE Face The Music.
+#define FTM_MIX_PERIOD         320
 #define FTM_CIA_BASE           709379U
 
 // Track effect opcodes
@@ -219,6 +222,24 @@ struct ftm_voice {
 	struct ftm_lfo_state lfo_states[FTM_NUM_LFO];
 };
 
+// Face The Music is an 8-track software-mixed format. Voices are paired
+// two-per-Paula-channel (base = track/2); the four base channels' fixed
+// hard pan reproduces ftm_pan_pos ({0,1}=L {2,3}=R {4,5}=R {6,7}=L). Each
+// base sums its two voices (at half level) into a CPU buffer DMA'd through
+// the real Paula channel, so paula.h's analog chain gives the right sound.
+struct ftm_softvoice {
+	int8_t *sample;
+	uint32_t length;
+	uint32_t loop_start;
+	uint32_t loop_length;          // 0 => one-shot
+	uint32_t pos;
+	uint32_t freq;                 // playback rate in Hz (FTM uses Hz)
+	uint64_t step_q;               // Q32 sample bytes per output sample
+	uint64_t step_acc;
+	uint16_t volume;               // 0..64
+	uint8_t active;
+};
+
 struct facethemusic_state {
 	struct paula paula;
 
@@ -261,10 +282,14 @@ struct facethemusic_state {
 	struct ftm_voice voices[FTM_NUM_TRACKS];
 
 	uint8_t end_reached;
-};
 
-// [=]===^=[ ftm_pan_pos ]========================================================================[=]
-static uint8_t ftm_pan_pos[FTM_NUM_TRACKS] = { 0, 0, 127, 127, 127, 127, 0, 0 };
+	// 8-track Split submixer: four base buffers (one block), one per
+	// Paula channel, regenerated each tick from the eight soft voices.
+	struct ftm_softvoice softv[FTM_NUM_TRACKS];
+	int8_t *softmix_buf;           // 4 contiguous n-sized base buffers
+	uint32_t softmix_cap;
+	int32_t softmix_period;
+};
 
 // [=]===^=[ ftm_effect_volume ]==================================================================[=]
 static uint8_t ftm_effect_volume[10] = { 0, 7, 14, 21, 28, 36, 43, 50, 57, 64 };
@@ -1826,12 +1851,143 @@ static void ftm_run_effects(struct facethemusic_state *s, struct ftm_voice *v) {
 	ftm_run_lfo(s, v);
 }
 
+// Every track is a soft voice; the four Paula channels each carry the CPU
+// sum of a voice pair (base = track/2). These wrappers capture the engine's
+// per-track register writes into soft-voice state.
+// [=]===^=[ ftm_pch_play_sample ]================================================================[=]
+static void ftm_pch_play_sample(struct facethemusic_state *s, int32_t ch, int8_t *sample, uint32_t length) {
+	struct ftm_softvoice *v = &s->softv[ch];
+	v->sample = sample;
+	v->length = length;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = 0;
+	v->step_acc = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ ftm_pch_set_pos ]====================================================================[=]
+static void ftm_pch_set_pos(struct facethemusic_state *s, int32_t ch, uint32_t byte_offset) {
+	struct ftm_softvoice *v = &s->softv[ch];
+	if(v->sample == 0 || v->length == 0) {
+		v->pos = 0;
+		return;
+	}
+	if(byte_offset >= v->length) {
+		byte_offset = v->length - 1;
+	}
+	v->pos = byte_offset;
+}
+
+// [=]===^=[ ftm_pch_set_loop ]===================================================================[=]
+static void ftm_pch_set_loop(struct facethemusic_state *s, int32_t ch, uint32_t start, uint32_t length) {
+	struct ftm_softvoice *v = &s->softv[ch];
+	v->loop_start = start;
+	v->loop_length = length;
+}
+
+// [=]===^=[ ftm_pch_set_freq_hz ]================================================================[=]
+static void ftm_pch_set_freq_hz(struct facethemusic_state *s, int32_t ch, uint32_t freq) {
+	s->softv[ch].freq = freq;
+}
+
+// [=]===^=[ ftm_pch_set_volume ]=================================================================[=]
+static void ftm_pch_set_volume(struct facethemusic_state *s, int32_t ch, uint16_t volume) {
+	if(volume > 64) {
+		volume = 64;
+	}
+	s->softv[ch].volume = volume;
+}
+
+// [=]===^=[ ftm_pch_mute ]=======================================================================[=]
+static void ftm_pch_mute(struct facethemusic_state *s, int32_t ch) {
+	s->softv[ch].active = 0;
+}
+
+// [=]===^=[ ftm_softvoice_advance ]==============================================================[=]
+static void ftm_softvoice_advance(struct ftm_softvoice *v) {
+	uint32_t np = v->pos + 1;
+	if(np >= v->length) {
+		if(v->loop_length > 0) {
+			uint32_t over = np - v->length;
+			np = v->loop_start + (over % v->loop_length);
+			v->length = v->loop_start + v->loop_length;
+		} else {
+			v->active = 0;
+			return;
+		}
+	}
+	v->pos = np;
+}
+
+// [=]===^=[ ftm_softmix_refill ]=================================================================[=]
+// Regenerate the four Split base buffers (base = track/2, two voices each
+// at half level so a pair can't exceed full scale) and arm Paula 0..3.
+static void ftm_softmix_refill(struct facethemusic_state *s) {
+	int32_t cp = s->softmix_period;
+	uint32_t R = (uint32_t)(s->paula.clock / cp);
+	if(R == 0) {
+		R = 1;
+	}
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)s->paula.samples_per_tick)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	if(n > s->softmix_cap) {
+		uint32_t nc = s->softmix_cap ? s->softmix_cap : 1024;
+		while(nc < n) {
+			nc <<= 1;
+		}
+		int8_t *nb = (int8_t *)realloc(s->softmix_buf, (size_t)nc * 4);
+		if(!nb) {
+			return;
+		}
+		s->softmix_buf = nb;
+		s->softmix_cap = nc;
+	}
+	for(int32_t i = 0; i < FTM_NUM_TRACKS; ++i) {
+		struct ftm_softvoice *v = &s->softv[i];
+		v->step_q = (v->freq != 0) ? (((uint64_t)v->freq << 32) / (uint64_t)R) : 0;
+	}
+	for(int32_t b = 0; b < 4; ++b) {
+		int8_t *buf = s->softmix_buf + (size_t)b * s->softmix_cap;
+		for(uint32_t k = 0; k < n; ++k) {
+			int32_t sam = 0;
+			for(int32_t i = 2 * b; i < 2 * b + 2; ++i) {
+				struct ftm_softvoice *v = &s->softv[i];
+				if(!v->active || v->sample == 0 || v->step_q == 0) {
+					continue;
+				}
+				sam += ((int32_t)v->sample[v->pos] * (int32_t)v->volume) / 128;
+				v->step_acc += v->step_q;
+				while(v->step_acc >= ((uint64_t)1 << 32)) {
+					v->step_acc -= ((uint64_t)1 << 32);
+					ftm_softvoice_advance(v);
+					if(!v->active) {
+						break;
+					}
+				}
+			}
+			if(sam > 127) {
+				sam = 127;
+			}
+			if(sam < -128) {
+				sam = -128;
+			}
+			buf[k] = (int8_t)sam;
+		}
+		paula_play_sample(&s->paula, b, buf, n);
+		paula_set_loop(&s->paula, b, 0, n);
+		paula_set_period(&s->paula, b, (uint16_t)cp);
+		paula_set_volume(&s->paula, b, 64);
+	}
+}
+
 // [=]===^=[ ftm_setup_hardware ]=================================================================[=]
 static void ftm_setup_hardware(struct facethemusic_state *s) {
 	for(uint32_t i = 0; i < FTM_NUM_TRACKS; ++i) {
 		int32_t chn = s->channel_mapping[i];
 		if(chn == -1) {
-			paula_mute(&s->paula, (int32_t)i);
+			ftm_pch_mute(s, (int32_t)i);
 			continue;
 		}
 		struct ftm_voice *v = &s->voices[i];
@@ -1840,12 +1996,12 @@ static void ftm_setup_hardware(struct facethemusic_state *s) {
 		if(v->retrig_sample) {
 			v->retrig_sample = 0;
 			uint32_t play_len = (v->sample_total_length > v->sample_start_offset) ? (v->sample_total_length - v->sample_start_offset) : 0;
-			paula_play_sample(&s->paula, paula_ch, v->sample_data, v->sample_start_offset + play_len);
-			paula_set_pos(&s->paula, paula_ch, v->sample_start_offset);
+			ftm_pch_play_sample(s, paula_ch, v->sample_data, v->sample_start_offset + play_len);
+			ftm_pch_set_pos(s, paula_ch, v->sample_start_offset);
 			if(v->sample_loop_length != 0) {
-				paula_set_loop(&s->paula, paula_ch, v->sample_loop_start, (uint32_t)v->sample_loop_length * 2U);
+				ftm_pch_set_loop(s, paula_ch, v->sample_loop_start, (uint32_t)v->sample_loop_length * 2U);
 			} else {
-				paula_set_loop(&s->paula, paula_ch, 0, 0);
+				ftm_pch_set_loop(s, paula_ch, 0, 0);
 			}
 		}
 
@@ -1871,14 +2027,13 @@ static void ftm_setup_hardware(struct facethemusic_state *s) {
 					freq = (uint32_t)new_freq;
 				}
 			}
-			paula_set_freq_hz(&s->paula, paula_ch, freq);
+			ftm_pch_set_freq_hz(s, paula_ch, freq);
 		}
 
 		uint32_t vol = ((uint32_t)v->volume * (uint32_t)s->global_volume) / 64U;
-		paula_set_volume(&s->paula, paula_ch, (uint16_t)vol);
-
-		s->paula.ch[paula_ch].pan = ftm_pan_pos[i];
+		ftm_pch_set_volume(s, paula_ch, (uint16_t)vol);
 	}
+	ftm_softmix_refill(s);
 }
 
 // [=]===^=[ ftm_initialize_sound ]===============================================================[=]
@@ -1956,6 +2111,8 @@ static void ftm_cleanup(struct facethemusic_state *s) {
 			s->tracks[i].lines = 0;
 		}
 	}
+	free(s->softmix_buf);
+	s->softmix_buf = 0;
 }
 
 // [=]===^=[ facethemusic_init ]==================================================================[=]
@@ -2019,6 +2176,7 @@ static struct facethemusic_state *facethemusic_init(void *data, uint32_t len, in
 	}
 
 	paula_init(&s->paula, sample_rate, 50);
+	s->softmix_period = FTM_MIX_PERIOD;
 	ftm_initialize_sound(s, 0, (uint16_t)(s->number_of_measures * s->rows_per_measure));
 
 	return s;

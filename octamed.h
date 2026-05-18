@@ -51,6 +51,9 @@
 #endif
 
 #define OCTAMED_MAX_TRACKS    8
+// Paula DMA period of a 5-8ch Split base channel's CPU submix.
+// Fidelity-only: each soft voice steps at its own Hz. A/B'd vs UADE.
+#define OCTAMED_MIX_PERIOD    320
 #define OCTAMED_MAX_INSTR     63
 #define OCTAMED_OCTAVES       6
 #define OCTAMED_MAX_BLOCKS    1024
@@ -238,6 +241,29 @@ struct octamed_pseq {
 	uint32_t count;
 };
 
+// OctaMED Split soft voice. 4-channel modules play directly on the four
+// hardware Paula channels. 5-8 channel modules pair tracks two-per-Paula-
+// channel (base = track & 3); the CPU sums each pair at half level into
+// that real channel (the authentic OctaMED 8-channel quality loss), and
+// the four base channels' fixed hard pan is the stereo image. OctaMED
+// feeds rates in Hz, so the soft voice steps by Hz like the engine.
+struct octamed_softvoice {
+	int8_t *sample;
+	uint32_t length;
+	uint32_t loop_start;
+	uint32_t loop_length;          // 0 => one-shot
+	uint32_t pos;
+	uint32_t freq;                 // Hz
+	uint64_t step_q;               // Q32 sample bytes per output sample
+	uint64_t step_acc;
+	int8_t *pending_sample;
+	uint32_t pending_pos;
+	uint32_t pending_length;
+	uint16_t volume;               // 0..64
+	uint8_t has_pending;
+	uint8_t active;
+};
+
 struct octamed_state {
 	struct paula paula;
 
@@ -297,6 +323,13 @@ struct octamed_state {
 
 	// Frequency table: [16 fine tune][72 notes].
 	uint16_t freq_table[16][72];
+
+	// 5-8 channel Split submixer: four base buffers (one block), one per
+	// Paula channel, regenerated each tick from the soft voices.
+	struct octamed_softvoice softv[OCTAMED_MAX_TRACKS];
+	int8_t *softmix_buf;           // 4 contiguous n-sized base buffers
+	uint32_t softmix_cap;
+	int32_t softmix_period;
 
 #ifdef OCTAMED_DEBUG_NOTES
 	uint64_t frames_played;
@@ -448,17 +481,220 @@ static uint32_t octamed_get_instr_note_freq(struct octamed_state *s, uint8_t not
 	return 0;
 }
 
-// [=]===^=[ octamed_set_paula_freq ]=============================================================[=]
-// Set channel playback rate in Hz directly. C# OctaMed Mixer.SetChannelFreq
-// calls VirtualChannels[chNum].SetFrequency(freq), not SetAmigaPeriod, so we
-// match it via paula_set_freq_hz -- this avoids the PAULA_MIN_PERIOD clamp on
-// notes whose intended rate exceeds the Amiga hardware limit.
-static void octamed_set_paula_freq(struct octamed_state *s, int32_t idx, int32_t freq) {
-	if(freq <= 0) {
-		paula_mute(&s->paula, idx);
+// 4-channel modules use the real hardware path; 5-8 channel modules route
+// every track through a soft voice (base = track & 3, summed into the real
+// base Paula channel). These wrappers are the single routing point.
+// [=]===^=[ omed_is_soft ]=======================================================================[=]
+static int32_t omed_is_soft(struct octamed_state *s) {
+	return s->num_channels > 4;
+}
+
+// [=]===^=[ omed_pch_play_sample ]===============================================================[=]
+static void omed_pch_play_sample(struct octamed_state *s, int32_t trk, int8_t *sample, uint32_t length) {
+	if(!omed_is_soft(s)) {
+		paula_play_sample(&s->paula, trk, sample, length);
 		return;
 	}
-	paula_set_freq_hz(&s->paula, idx, (uint32_t)freq);
+	struct octamed_softvoice *v = &s->softv[trk];
+	v->sample = sample;
+	v->length = length;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = 0;
+	v->step_acc = 0;
+	v->has_pending = 0;
+	v->pending_sample = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ omed_pch_queue_sample ]==============================================================[=]
+static void omed_pch_queue_sample(struct octamed_state *s, int32_t trk, int8_t *sample, uint32_t start_offset, uint32_t length) {
+	if(!omed_is_soft(s)) {
+		paula_queue_sample(&s->paula, trk, sample, start_offset, length);
+		return;
+	}
+	struct octamed_softvoice *v = &s->softv[trk];
+	if(!v->active && sample != 0 && length > 0) {
+		v->sample = sample;
+		v->pos = start_offset;
+		v->length = start_offset + length;
+		v->step_acc = 0;
+		v->has_pending = 0;
+		v->pending_sample = 0;
+		v->active = 1;
+		return;
+	}
+	v->pending_sample = sample;
+	v->pending_pos = start_offset;
+	v->pending_length = start_offset + length;
+	v->has_pending = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ omed_pch_set_loop ]==================================================================[=]
+static void omed_pch_set_loop(struct octamed_state *s, int32_t trk, uint32_t start, uint32_t length) {
+	if(!omed_is_soft(s)) {
+		paula_set_loop(&s->paula, trk, start, length);
+		return;
+	}
+	struct octamed_softvoice *v = &s->softv[trk];
+	v->loop_start = start;
+	v->loop_length = length;
+}
+
+// [=]===^=[ omed_pch_set_pos ]===================================================================[=]
+static void omed_pch_set_pos(struct octamed_state *s, int32_t trk, uint32_t byte_offset) {
+	if(!omed_is_soft(s)) {
+		paula_set_pos(&s->paula, trk, byte_offset);
+		return;
+	}
+	struct octamed_softvoice *v = &s->softv[trk];
+	if(v->sample == 0 || v->length == 0) {
+		v->pos = 0;
+		return;
+	}
+	if(byte_offset >= v->length) {
+		byte_offset = v->length - 1;
+	}
+	v->pos = byte_offset;
+}
+
+// [=]===^=[ omed_pch_get_pos ]===================================================================[=]
+static uint32_t omed_pch_get_pos(struct octamed_state *s, int32_t trk) {
+	if(!omed_is_soft(s)) {
+		return s->paula.ch[trk].pos;
+	}
+	return s->softv[trk].pos;
+}
+
+// [=]===^=[ omed_pch_set_volume_256 ]============================================================[=]
+static void omed_pch_set_volume_256(struct octamed_state *s, int32_t trk, uint16_t vol256) {
+	if(!omed_is_soft(s)) {
+		paula_set_volume_256(&s->paula, trk, vol256);
+		return;
+	}
+	uint16_t v = (uint16_t)(vol256 >> 2);
+	if(v > 64) {
+		v = 64;
+	}
+	s->softv[trk].volume = v;
+}
+
+// [=]===^=[ omed_pch_mute ]======================================================================[=]
+static void omed_pch_mute(struct octamed_state *s, int32_t trk) {
+	if(!omed_is_soft(s)) {
+		paula_mute(&s->paula, trk);
+		return;
+	}
+	s->softv[trk].active = 0;
+}
+
+// [=]===^=[ omed_pch_set_freq_hz ]===============================================================[=]
+static void omed_pch_set_freq_hz(struct octamed_state *s, int32_t trk, uint32_t freq) {
+	if(!omed_is_soft(s)) {
+		paula_set_freq_hz(&s->paula, trk, freq);
+		return;
+	}
+	s->softv[trk].freq = freq;
+}
+
+// [=]===^=[ omed_softvoice_advance ]=============================================================[=]
+static void omed_softvoice_advance(struct octamed_softvoice *v) {
+	uint32_t np = v->pos + 1;
+	if(np >= v->length) {
+		if(v->has_pending) {
+			v->sample = v->pending_sample;
+			np = v->pending_pos;
+			v->length = v->pending_length;
+			v->has_pending = 0;
+			v->pending_sample = 0;
+		} else if(v->loop_length > 0) {
+			uint32_t over = np - v->length;
+			np = v->loop_start + (over % v->loop_length);
+			v->length = v->loop_start + v->loop_length;
+		} else {
+			v->active = 0;
+			return;
+		}
+	}
+	v->pos = np;
+}
+
+// [=]===^=[ octamed_softmix_refill ]=============================================================[=]
+// Regenerate the four Split base buffers (base = track & 3; the <=2 tracks
+// on a base summed at half level) and arm Paula 0..3. Hz -> per-output
+// step via R = clock / period.
+static void octamed_softmix_refill(struct octamed_state *s) {
+	int32_t cp = s->softmix_period;
+	uint32_t R = (uint32_t)(s->paula.clock / cp);
+	if(R == 0) {
+		R = 1;
+	}
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)s->paula.samples_per_tick)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	if(n > s->softmix_cap) {
+		uint32_t nc = s->softmix_cap ? s->softmix_cap : 1024;
+		while(nc < n) {
+			nc <<= 1;
+		}
+		int8_t *nb = (int8_t *)realloc(s->softmix_buf, (size_t)nc * 4);
+		if(!nb) {
+			return;
+		}
+		s->softmix_buf = nb;
+		s->softmix_cap = nc;
+	}
+	for(int32_t i = 0; i < OCTAMED_MAX_TRACKS; ++i) {
+		struct octamed_softvoice *v = &s->softv[i];
+		v->step_q = (v->freq != 0) ? (((uint64_t)v->freq << 32) / (uint64_t)R) : 0;
+	}
+	for(int32_t b = 0; b < 4; ++b) {
+		int8_t *buf = s->softmix_buf + (size_t)b * s->softmix_cap;
+		for(uint32_t k = 0; k < n; ++k) {
+			int32_t sam = 0;
+			for(int32_t i = b; i < (int32_t)s->num_channels; i += 4) {
+				struct octamed_softvoice *v = &s->softv[i];
+				if(!v->active || v->sample == 0 || v->step_q == 0) {
+					continue;
+				}
+				// OctaMED 8-channel sums the two tracks on a Paula channel
+				// without pre-attenuation; the int8 clamp and paula.h's
+				// resistive summer give the authentic level/grit.
+				sam += ((int32_t)v->sample[v->pos] * (int32_t)v->volume) / 64;
+				v->step_acc += v->step_q;
+				while(v->step_acc >= ((uint64_t)1 << 32)) {
+					v->step_acc -= ((uint64_t)1 << 32);
+					omed_softvoice_advance(v);
+					if(!v->active) {
+						break;
+					}
+				}
+			}
+			if(sam > 127) {
+				sam = 127;
+			}
+			if(sam < -128) {
+				sam = -128;
+			}
+			buf[k] = (int8_t)sam;
+		}
+		paula_play_sample(&s->paula, b, buf, n);
+		paula_set_loop(&s->paula, b, 0, n);
+		paula_set_period(&s->paula, b, (uint16_t)cp);
+		paula_set_volume(&s->paula, b, 64);
+	}
+}
+
+// [=]===^=[ octamed_set_paula_freq ]=============================================================[=]
+// Set track playback rate in Hz. C# OctaMed Mixer.SetChannelFreq calls
+// SetFrequency, not SetAmigaPeriod, so we feed Hz -- this avoids the
+// PAULA_MIN_PERIOD clamp on notes above the hardware limit.
+static void octamed_set_paula_freq(struct octamed_state *s, int32_t idx, int32_t freq) {
+	if(freq <= 0) {
+		omed_pch_mute(s, idx);
+		return;
+	}
+	omed_pch_set_freq_hz(s, idx, (uint32_t)freq);
 }
 
 // [=]===^=[ octamed_set_mix_tempo ]==============================================================[=]
@@ -527,6 +763,8 @@ static void octamed_cleanup(struct octamed_state *s) {
 			s->instr[i].synth = 0;
 		}
 	}
+	free(s->softmix_buf);
+	s->softmix_buf = 0;
 }
 
 // [=]===^=[ octamed_apply_old_vol ]==============================================================[=]
@@ -1774,7 +2012,7 @@ static void octamed_extract_instr_data(struct octamed_state *s, struct octamed_t
 // the appropriate buffer based on `note` and shifts loop_start/length.
 static void octamed_play_paula_sample(struct octamed_state *s, int32_t idx, struct octamed_instr *ci, uint32_t s_offset, uint8_t note) {
 	if(!ci->valid || ci->sample_data == 0 || ci->sample_length == 0) {
-		paula_mute(&s->paula, idx);
+		omed_pch_mute(s, idx);
 		return;
 	}
 
@@ -1807,14 +2045,14 @@ static void octamed_play_paula_sample(struct octamed_state *s, int32_t idx, stru
 	if(off >= buf_len) {
 		off = 0;
 	}
-	paula_play_sample(&s->paula, idx, ci->sample_data + buf_off, buf_len);
+	omed_pch_play_sample(s, idx, ci->sample_data + buf_off, buf_len);
 	if((ci->flags & OCTAMED_IFLAG_LOOP) && loop_l > 2) {
-		paula_set_loop(&s->paula, idx, loop_s, loop_l);
+		omed_pch_set_loop(s, idx, loop_s, loop_l);
 	} else {
-		paula_set_loop(&s->paula, idx, 0, 0);
+		omed_pch_set_loop(s, idx, 0, 0);
 	}
 	if(off > 0) {
-		paula_set_pos(&s->paula, idx, off);
+		omed_pch_set_pos(s, idx, off);
 	}
 }
 
@@ -1826,7 +2064,7 @@ static void octamed_mute_track(struct octamed_state *s, int32_t trk) {
 		return;
 	}
 	s->td[trk].sy_type = OCTAMED_SYTYPE_NONE;
-	paula_mute(&s->paula, trk);
+	omed_pch_mute(s, trk);
 }
 
 // [=]===^=[ octamed_clear_synth ]================================================================[=]
@@ -1879,13 +2117,13 @@ static void octamed_set_synth_waveform(struct octamed_state *s, int32_t trk, int
 	}
 	t = &s->td[trk];
 	if(t->sy_start) {
-		paula_play_sample(&s->paula, trk, data, length);
+		omed_pch_play_sample(s, trk, data, length);
 		t->sy_start = 0;
 	} else {
 		// Hot-swap the underlying buffer without restarting position.
-		paula_queue_sample(&s->paula, trk, data, 0, length);
+		omed_pch_queue_sample(s, trk, data, 0, length);
 	}
-	paula_set_loop(&s->paula, trk, 0, length);
+	omed_pch_set_loop(s, trk, 0, length);
 }
 
 // [=]===^=[ octamed_synth_handler ]==============================================================[=]
@@ -2429,7 +2667,7 @@ static void octamed_update_freq_vol(struct octamed_state *s, int32_t trk) {
 	}
 	int32_t freq = base_freq + t->arp_adjust + t->vibr_adjust;
 	if(freq <= 0 || freq > 65535) {
-		paula_mute(&s->paula, trk);
+		omed_pch_mute(s, trk);
 	} else {
 		octamed_set_paula_freq(s, trk, freq);
 	}
@@ -2443,7 +2681,7 @@ static void octamed_update_freq_vol(struct octamed_state *s, int32_t trk) {
 	if(scaled > 128) {
 		scaled = 128;
 	}
-	paula_set_volume_256(&s->paula, trk, (uint16_t)(scaled * 2));
+	omed_pch_set_volume_256(s, trk, (uint16_t)(scaled * 2));
 	t->arp_adjust = 0;
 	t->vibr_adjust = 0;
 }
@@ -2830,7 +3068,7 @@ static void octamed_handle_per_tick_fx(struct octamed_state *s, struct octamed_b
 			}
 			case 0x20: {
 				if(s->pulse_ctr == 0 && data != 0) {
-					paula_set_pos(&s->paula, trk, s->paula.ch[trk].pos + (uint32_t)data_w);
+					omed_pch_set_pos(s, trk, omed_pch_get_pos(s, trk) + (uint32_t)data_w);
 				}
 				break;
 			}
@@ -2861,7 +3099,7 @@ static void octamed_handle_per_tick_fx(struct octamed_state *s, struct octamed_b
 					// Mirrors C# !smp.IsSynthSound() check: skip on synth-only.
 					if(ci->valid && ci->sample_data && ci->synth == 0 && data < div) {
 						uint32_t pos = ((uint32_t)data * ci->sample_length) / div;
-						paula_set_pos(&s->paula, trk, pos);
+						omed_pch_set_pos(s, trk, pos);
 					}
 				}
 				break;
@@ -3036,6 +3274,7 @@ static struct octamed_state *octamed_init(void *data, uint32_t len, int32_t samp
 	// paula_init must run before octamed_load: the loader calls
 	// paula_set_lp_filter for songs whose flags request the LED filter.
 	paula_init(&s->paula, sample_rate, 50);
+	s->softmix_period = OCTAMED_MIX_PERIOD;
 	octamed_build_freq_table(s);
 	if(!octamed_load(s, (uint8_t *)data, len)) {
 		octamed_cleanup(s);
@@ -3043,6 +3282,9 @@ static struct octamed_state *octamed_init(void *data, uint32_t len, int32_t samp
 		return 0;
 	}
 	octamed_initialize_sound(s);
+	if(s->num_channels > 4) {
+		octamed_softmix_refill(s);
+	}
 	return s;
 }
 
@@ -3072,6 +3314,9 @@ static void octamed_get_audio(struct octamed_state *s, float *output, int32_t fr
 		if(s->paula.tick_offset >= s->paula.samples_per_tick) {
 			s->paula.tick_offset = 0;
 			octamed_tick(s);
+			if(s->num_channels > 4) {
+				octamed_softmix_refill(s);
+			}
 		}
 	}
 }

@@ -16,12 +16,12 @@
 // integration of the Paula-clock samples that fall in each output window.
 // Aliasing and quantization noise that a real A500 produces are preserved.
 //
-// Channels 0..3 are the hardware Paula path. Channels 4.. are a software-
-// mixer extension used by formats that fake extra voices (Hippel 7, OctaMed
-// 8, DBM up to 32). Those run in the same Paula clock domain with the same
-// zero-order-hold, but use linear volume and their pan field, and are summed
-// in after the analog filters (they are not hardware, so the A500 filter
-// chain does not apply to them).
+// Paula has exactly four hardware channels (0..3). There is no software-
+// mixer extension and no side bus: a real Amiga has no extra channel in its
+// signal path. Every format with more than four voices built a mixed buffer
+// on the CPU and DMA'd THAT through these four channels, so any such mixdown
+// is the replayer's job and its output IS Paula channel sample data, <= 4
+// channels, passing through this same hardware path.
 //
 // Output is ACCUMULATED into the caller's float buffer. The hardware output
 // chain is modelled end to end, to the RCA jack, not just to the summer node:
@@ -43,11 +43,6 @@
 //      the machine never produces) and not clip-free. Absolute level is the
 //      host's concern; this trades ~6 dB of headroom for a faithful
 //      saturation onset.
-//
-// The software-mixer extension (channels 4..) is NOT hardware: it is summed
-// into the post-amp output bus linearly (one such voice at full volume = 1.0),
-// its level is the driving replayer's responsibility, and the host remains
-// the last-resort saturation point only for that path.
 
 #pragma once
 
@@ -66,10 +61,9 @@ static double paula_profile_cpu_ns = 0.0;
 static uint64_t paula_profile_frames = 0;
 #endif
 
-// PAULA_NUM_CHANNELS sets the number of virtual channels. Real Paula has 4
-// (indices 0..3, the hardware path); the rest are the software-mixer
-// extension for formats that fake more voices via CPU mixing.
-#define PAULA_NUM_CHANNELS 32
+// Paula has exactly four hardware channels. Formats with more voices must
+// CPU-mix down to <= 4 themselves; there is no extra channel here.
+#define PAULA_NUM_CHANNELS 4
 #define PAULA_PAL_CLOCK    3546895
 #define PAULA_NTSC_CLOCK   3579545
 // Real Paula audio DMA floor. The Hardware Reference Manual's period-124
@@ -77,9 +71,8 @@ static uint64_t paula_profile_frames = 0;
 // falling behind during display fetch; a single channel goes lower. The true
 // hardware floor is period 113 -- the ProTracker/Soundtracker note table
 // bottoms at exactly 113 (B-3) because that is where Paula stops. Clamping to
-// 124 detunes the whole top octave flat (period 113 -> ~160 cents). The
-// hardware channels (0..3) clamp to this; CPU-fed software channels (4..)
-// have no such floor.
+// 124 detunes the whole top octave flat (period 113 -> ~160 cents). All four
+// hardware channels clamp to this.
 #define PAULA_DMA_MIN_PERIOD 113
 
 // Period accumulator fixed-point: one Paula clock advances the accumulator by
@@ -102,10 +95,9 @@ struct paula_channel {
 	uint32_t pending_length;
 	int8_t cur;                // latched sample byte (zero-order-hold output)
 	uint16_t volume;           // 0..64 Amiga scale
-	uint8_t pwm_cnt;           // 0..63 volume-PWM phase (hardware channels)
+	uint8_t pwm_cnt;           // 0..63 volume-PWM phase
 	uint8_t active;
 	uint8_t muted;
-	uint8_t pan;               // 0..127, 0=left 127=right (software channels)
 	uint8_t has_pending;
 	uint8_t backwards;         // 1 -> step DOWN through sample (DBP E3, etc.)
 };
@@ -192,11 +184,7 @@ static void paula_init(struct paula *p, int32_t sample_rate, int32_t tick_rate_h
 	p->clock = PAULA_PAL_CLOCK;
 	p->samples_per_tick = sample_rate / tick_rate_hz;
 	p->model = PAULA_MODEL_A500;
-	// 0+3 -> left, 1+2 -> right for the hardware channels; the software
-	// channels default to the same LRRL pattern until a player sets pan.
-	for(int32_t i = 0; i < PAULA_NUM_CHANNELS; ++i) {
-		p->ch[i].pan = ((i & 2) != 0) ^ ((i & 1) != 0) ? 127 : 0;
-	}
+	// Hard-panned: channels 0+3 -> left, 1+2 -> right (fixed Paula wiring).
 	paula_recalc(p);
 }
 
@@ -224,10 +212,10 @@ static void paula_set_lp_filter(struct paula *p, int32_t on) {
 }
 
 // [=]===^=[ paula_set_period ]===================================================================[=]
-// Amiga AUDxPER (DMA) period. The hardware channels (0..3) clamp to the real
-// Paula DMA minimum of 124; software channels (4..) have no such floor.
+// Amiga AUDxPER (DMA) period. All four hardware channels clamp to the real
+// Paula DMA minimum period.
 static void paula_set_period(struct paula *p, int32_t idx, uint16_t period) {
-	if(idx < 4 && period != 0 && period < PAULA_DMA_MIN_PERIOD) {
+	if(period != 0 && period < PAULA_DMA_MIN_PERIOD) {
 		period = PAULA_DMA_MIN_PERIOD;
 	}
 	if(period == 0) {
@@ -238,9 +226,10 @@ static void paula_set_period(struct paula *p, int32_t idx, uint16_t period) {
 }
 
 // [=]===^=[ paula_set_freq_hz ]==================================================================[=]
-// Set channel playback rate directly in Hz (CPU-fed software path, e.g.
-// DigiBoosterPro/FaceTheMusic). No DMA period floor; the period is fractional
-// in the Paula clock domain so pitch stays exact.
+// Set a channel's DMA rate directly in Hz, for replayers that DMA a
+// CPU-built mixdown buffer through a Paula channel (DigiBoosterPro, FaceThe-
+// Music). The period is fractional in the Paula clock domain so pitch stays
+// exact. No DMA period floor: mixdown rates are well above it anyway.
 static void paula_set_freq_hz(struct paula *p, int32_t idx, uint32_t freq_hz) {
 	if(freq_hz == 0) {
 		p->ch[idx].period_q = 0;
@@ -430,36 +419,24 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 	// lands at ~0.5 (linear, clear of the 0.8 soft knee) and two correlated
 	// full-scale channels on a side at ~1.0 (just into the knee), so the
 	// saturator only engages on genuinely hot correlated content the way a
-	// real A500 does -- not on ordinary single/normal-level material.
-	// lin_scale puts one software (channel >=4) voice at full volume at 1.0
-	// in the same normalized domain. Output is the box-filter average over
-	// the window (/n).
+	// real A500 does -- not on ordinary single/normal-level material. Output
+	// is the box-filter average over the window (/n).
 	const double amp_gain = 1.0 / 128.0;
-	const double lin_scale = 1.0 / (64.0 * 127.0 * 128.0);
 
 	// Active-channel working set, built once per call. The selection
 	// predicate (active / unmuted / has sample / nonzero period) is stable
 	// within a mix call: only `active` can drop, when a one-shot sample ends
-	// mid-call, which the inner loop already detects per channel. Hardware
-	// (0..3) and software (4..) channels go in separate ascending lists so
-	// the per-clock loop carries no hardware/software path branch and the
-	// software path vanishes entirely for formats that never use it.
-	// Ascending order matches the original 0..31 index sweep, so each mix
-	// accumulator sees the same addition order and the output is bit-identical.
-	uint32_t hw[4];
-	uint32_t sw[PAULA_NUM_CHANNELS - 4];
+	// mid-call, which the inner loop already detects per channel. Ascending
+	// order matches the 0..3 index sweep so each mix accumulator sees the
+	// same addition order and the output is bit-identical.
+	uint32_t hw[PAULA_NUM_CHANNELS];
 	uint32_t nhw = 0;
-	uint32_t nsw = 0;
 	for(int32_t ci = 0; ci < PAULA_NUM_CHANNELS; ++ci) {
 		struct paula_channel *c = &p->ch[ci];
 		if(!c->active || c->muted || c->sample == 0 || c->period_q == 0) {
 			continue;
 		}
-		if(ci < 4) {
-			hw[nhw++] = (uint32_t)ci;
-		} else {
-			sw[nsw++] = (uint32_t)ci;
-		}
+		hw[nhw++] = (uint32_t)ci;
 	}
 
 	for(int32_t i = 0; i < frames; ++i) {
@@ -474,8 +451,6 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 		for(uint32_t k = 0; k < n; ++k) {
 			double pl = 0.0;
 			double pr = 0.0;
-			double ll = 0.0;
-			double rl = 0.0;
 			for(uint32_t j = 0; j < nhw; ++j) {
 				uint32_t ci = hw[j];
 				struct paula_channel *c = &p->ch[ci];
@@ -501,26 +476,6 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 					pr += (double)s;
 				}
 			}
-			for(uint32_t j = 0; j < nsw; ++j) {
-				struct paula_channel *c = &p->ch[sw[j]];
-				if(!c->active) {
-					continue;
-				}
-				c->period_acc += PAULA_PERIOD_ONE;
-				while(c->period_acc >= c->period_q) {
-					c->period_acc -= c->period_q;
-					paula_ch_advance(c);
-					if(!c->active) {
-						break;
-					}
-				}
-				if(!c->active) {
-					continue;
-				}
-				int32_t v = (int32_t)c->cur * (int32_t)c->volume;
-				ll += (double)(v * (int32_t)(127 - c->pan));
-				rl += (double)(v * (int32_t)c->pan);
-			}
 			// Passive resistive averaging summer: the per-side filter
 			// node is (ch_a + ch_b) / 2, so it cannot exceed a single
 			// channel's full scale and the hardware path never clips.
@@ -543,14 +498,9 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 				xr = yr;
 			}
 			// Downstream output buffer/amp: gain compensation then soft
-			// saturation into the rails (the analog stage sees only the
-			// hardware channels).
+			// saturation into the rails.
 			xl = paula_softclip(xl * amp_gain);
 			xr = paula_softclip(xr * amp_gain);
-			// Software-mixer extension (channels 4..): not hardware, so it
-			// is summed into the post-amp output bus, not through the amp.
-			xl += ll * lin_scale;
-			xr += rl * lin_scale;
 			sl += xl;
 			sr += xr;
 		}

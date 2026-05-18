@@ -43,9 +43,15 @@
 #include <string.h>
 #include <math.h>
 #include "player_api.h"
+#include "paula.h"
 
 #define HIVELY_MAX_CHANNELS 16
 #define HIVELY_VOICE_BUFLEN 0x281
+// Paula DMA period of the AHX/HVL L/R software-mix output. Fidelity-only.
+#define HIVELY_MIX_PERIOD   320
+// Post-mix scale into the int8 Paula DMA domain. Calibrated by A/B against
+// UADE's AHX so the level matches after paula.h's amp/summer/soft-clip.
+#define HIVELY_MIX_SHIFT    22
 #define HIVELY_RING_BUFLEN  (0x282 * 4)
 #define HIVELY_FILTER_SETS  63
 #define HIVELY_WAVE_LEN     (0x04 + 0x08 + 0x10 + 0x20 + 0x40 + 0x80)
@@ -290,6 +296,16 @@ struct hivelytracker_state {
 
 	int32_t tick_samples;
 	int32_t tick_offset;
+
+	// AHX/HVL is CPU-mixed on a real Amiga and the result DMA'd through
+	// Paula. The synth+ring+filter+pan math (unchanged) builds an int8
+	// L/R pair per tick that is fed through paula.h ch0 (L) / ch1 (R), so
+	// the output gets Paula's ZOH, volume PWM, resistive summer and the
+	// A500 analog chain instead of bypassing them.
+	struct paula paula;
+	int8_t *softmix_buf;           // 2 contiguous n-sized buffers (L, R)
+	uint32_t softmix_cap;
+	int32_t softmix_period;
 };
 
 // [=]===^=[ hively_period_table ]================================================================[=]
@@ -2067,99 +2083,6 @@ static void hively_play_irq(struct hivelytracker_state *s) {
 	}
 }
 
-// [=]===^=[ hively_mix_chunk ]===================================================================[=]
-//
-// Mixes one tick worth of samples and ACCUMULATES into the caller's float stereo
-// output buffer (output is 2 * frames samples). Internal sample buffers in voice
-// are 0x280 bytes (with a duplicate sample at index 0x280 to act as a wrap
-// guard); positions are 16.16 fixed point indices into them.
-//
-// Normalization: a single voice at peak sample (|s|=128), max voice_volume (64),
-// max pan_l (255), and unity mix_gain (256) yields |1.0| on its side. No clamp
-// is applied; the host saturates at the final output stage.
-static void hively_mix_chunk(struct hivelytracker_state *s, float *output, int32_t frames) {
-	// Combined per-sample scale: sample(/128) * vol(/64) * pan(/255) * mix_gain(/256).
-	const float norm = 1.0f / (128.0f * 64.0f * 255.0f * 256.0f);
-	float gain = (float)s->song.mix_gain * norm;
-
-	int32_t chans = s->song.channels;
-	int8_t *src[HIVELY_MAX_CHANNELS];
-	int8_t *r_src[HIVELY_MAX_CHANNELS];
-	int32_t delta[HIVELY_MAX_CHANNELS];
-	int32_t r_delta[HIVELY_MAX_CHANNELS];
-	int32_t vol[HIVELY_MAX_CHANNELS];
-	int32_t pos[HIVELY_MAX_CHANNELS];
-	int32_t r_pos[HIVELY_MAX_CHANNELS];
-	float pan_l[HIVELY_MAX_CHANNELS];
-	float pan_r[HIVELY_MAX_CHANNELS];
-
-	for(int32_t i = 0; i < chans; ++i) {
-		struct hively_voice *voice = &s->voices[i];
-		int32_t pan = voice->pan;
-		if(pan < 0) { pan = 0; }
-		if(pan > 255) { pan = 255; }
-		delta[i] = voice->delta != 0 ? voice->delta : 1;
-		vol[i] = voice->voice_volume;
-		pos[i] = voice->sample_pos;
-		src[i] = voice->mix_source;
-		pan_l[i] = (float)s->waves->panning_left[pan];
-		pan_r[i] = (float)s->waves->panning_right[pan];
-		r_delta[i] = voice->ring_delta != 0 ? voice->ring_delta : 1;
-		r_pos[i] = voice->ring_sample_pos;
-		r_src[i] = voice->ring_mix_source;
-	}
-
-	int32_t samples = frames;
-	int32_t out_offset = 0;
-
-	while(samples > 0) {
-		int32_t loops = samples;
-		for(int32_t i = 0; i < chans; ++i) {
-			if(pos[i] >= (0x280 << 16)) {
-				pos[i] -= 0x280 << 16;
-			}
-			int32_t cnt = ((0x280 << 16) - pos[i] - 1) / delta[i] + 1;
-			if(cnt < loops) { loops = cnt; }
-			if(r_src[i] != 0) {
-				if(r_pos[i] >= (0x280 << 16)) {
-					r_pos[i] -= 0x280 << 16;
-				}
-				cnt = ((0x280 << 16) - r_pos[i] - 1) / r_delta[i] + 1;
-				if(cnt < loops) { loops = cnt; }
-			}
-		}
-		samples -= loops;
-
-		while(loops > 0) {
-			float a = 0.0f;
-			float b = 0.0f;
-			for(int32_t i = 0; i < chans; ++i) {
-				float j;
-				if(r_src[i] != 0 && src[i] != 0) {
-					int32_t prod = (src[i][pos[i] >> 16] * r_src[i][r_pos[i] >> 16]) >> 7;
-					j = (float)(prod * vol[i]);
-					r_pos[i] += r_delta[i];
-				} else if(src[i] != 0) {
-					j = (float)((int32_t)src[i][pos[i] >> 16] * vol[i]);
-				} else {
-					j = 0.0f;
-				}
-				a += j * pan_l[i];
-				b += j * pan_r[i];
-				pos[i] += delta[i];
-			}
-			output[out_offset * 2 + 0] += a * gain;
-			output[out_offset * 2 + 1] += b * gain;
-			loops--;
-			out_offset++;
-		}
-	}
-
-	for(int32_t i = 0; i < chans; ++i) {
-		s->voices[i].sample_pos = pos[i];
-		s->voices[i].ring_sample_pos = r_pos[i];
-	}
-}
 
 // [=]===^=[ hively_tick ]========================================================================[=]
 static void hively_tick(struct hivelytracker_state *s) {
@@ -2195,6 +2118,83 @@ static void hively_cleanup(struct hivelytracker_state *s) {
 		free(s->waves);
 		s->waves = 0;
 	}
+	free(s->softmix_buf);
+	s->softmix_buf = 0;
+}
+
+// [=]===^=[ hively_softmix_refill ]==============================================================[=]
+// Render one player tick of the full software stereo mix into int8 L/R
+// buffers (the exact unchanged synth/ring/pan math) and arm Paula ch0 (L)
+// / ch1 (R); ch2/3 muted. Each voice steps at cp/period in the Paula
+// clock domain so pitch is exact; paula.h then applies the real Amiga
+// ZOH/PWM/summer/analog colouring the float bypass never had.
+static void hively_softmix_refill(struct hivelytracker_state *s) {
+	int32_t cp = s->softmix_period;
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)s->paula.samples_per_tick)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	if(n > s->softmix_cap) {
+		uint32_t nc = s->softmix_cap ? s->softmix_cap : 1024;
+		while(nc < n) {
+			nc <<= 1;
+		}
+		int8_t *nb = (int8_t *)realloc(s->softmix_buf, (size_t)nc * 2);
+		if(!nb) {
+			return;
+		}
+		s->softmix_buf = nb;
+		s->softmix_cap = nc;
+	}
+	int32_t chans = s->song.channels;
+	int8_t *bl = s->softmix_buf;
+	int8_t *br = s->softmix_buf + s->softmix_cap;
+	int64_t mg = (int64_t)s->song.mix_gain;
+	for(uint32_t k = 0; k < n; ++k) {
+		int64_t accl = 0;
+		int64_t accr = 0;
+		for(int32_t i = 0; i < chans; ++i) {
+			struct hively_voice *v = &s->voices[i];
+			int32_t pan = v->pan;
+			if(pan < 0) { pan = 0; }
+			if(pan > 255) { pan = 255; }
+			int32_t per = v->audio_period > 0 ? v->audio_period : 1;
+			uint64_t step = ((uint64_t)(uint32_t)cp << 16) / (uint64_t)per;
+			int32_t jv;
+			if(v->ring_mix_source != 0 && v->mix_source != 0) {
+				int32_t rper = v->ring_audio_period > 0 ? v->ring_audio_period : 1;
+				uint64_t rstep = ((uint64_t)(uint32_t)cp << 16) / (uint64_t)rper;
+				int32_t prod = (v->mix_source[(v->sample_pos >> 16) % 0x280]
+					* v->ring_mix_source[(v->ring_sample_pos >> 16) % 0x280]) >> 7;
+				jv = prod * v->voice_volume;
+				v->ring_sample_pos += (int32_t)rstep;
+			} else if(v->mix_source != 0) {
+				jv = (int32_t)v->mix_source[(v->sample_pos >> 16) % 0x280] * v->voice_volume;
+			} else {
+				jv = 0;
+			}
+			accl += (int64_t)jv * (int64_t)s->waves->panning_left[pan];
+			accr += (int64_t)jv * (int64_t)s->waves->panning_right[pan];
+			v->sample_pos += (int32_t)step;
+		}
+		accl = (accl * mg) >> HIVELY_MIX_SHIFT;
+		accr = (accr * mg) >> HIVELY_MIX_SHIFT;
+		if(accl > 127) { accl = 127; }
+		if(accl < -128) { accl = -128; }
+		if(accr > 127) { accr = 127; }
+		if(accr < -128) { accr = -128; }
+		bl[k] = (int8_t)accl;
+		br[k] = (int8_t)accr;
+	}
+	paula_play_sample(&s->paula, 0, bl, n);
+	paula_set_loop(&s->paula, 0, 0, n);
+	paula_set_period(&s->paula, 0, (uint16_t)cp);
+	paula_set_volume(&s->paula, 0, 64);
+	paula_play_sample(&s->paula, 1, br, n);
+	paula_set_loop(&s->paula, 1, 0, n);
+	paula_set_period(&s->paula, 1, (uint16_t)cp);
+	paula_set_volume(&s->paula, 1, 64);
+	paula_mute(&s->paula, 2);
+	paula_mute(&s->paula, 3);
 }
 
 // [=]===^=[ hivelytracker_init ]=================================================================[=]
@@ -2233,6 +2233,10 @@ static struct hivelytracker_state *hivelytracker_init(void *data, uint32_t len, 
 	if(s->tick_samples < 1) { s->tick_samples = 1; }
 	s->tick_offset = 0;
 
+	paula_init(&s->paula, sample_rate, tick_hz);
+	s->softmix_period = HIVELY_MIX_PERIOD;
+	hively_softmix_refill(s);
+
 	return s;
 }
 
@@ -2246,15 +2250,16 @@ static void hivelytracker_free(struct hivelytracker_state *s) {
 // [=]===^=[ hivelytracker_get_audio ]============================================================[=]
 static void hivelytracker_get_audio(struct hivelytracker_state *s, float *output, int32_t frames) {
 	while(frames > 0) {
-		int32_t remain = s->tick_samples - s->tick_offset;
+		int32_t remain = s->paula.samples_per_tick - s->paula.tick_offset;
 		if(remain > frames) { remain = frames; }
-		hively_mix_chunk(s, output, remain);
+		paula_mix_frames(&s->paula, output, remain);
 		output += remain * 2;
-		s->tick_offset += remain;
+		s->paula.tick_offset += remain;
 		frames -= remain;
-		if(s->tick_offset >= s->tick_samples) {
-			s->tick_offset = 0;
+		if(s->paula.tick_offset >= s->paula.samples_per_tick) {
+			s->paula.tick_offset = 0;
 			hively_tick(s);
+			hively_softmix_refill(s);
 		}
 	}
 }

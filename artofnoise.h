@@ -19,6 +19,9 @@
 #include "player_api.h"
 
 #define AON_TICK_HZ              50
+// Paula DMA period of the AON8 L/R software-mix output. Fidelity-only:
+// each soft voice steps at its own pitch. A/B'd against UADE Art of Noise.
+#define AON_MIX_PERIOD           320
 #define AON_DEFAULT_TEMPO        125
 #define AON_DEFAULT_SPEED        6
 #define AON_MAX_CHANNELS         8
@@ -187,6 +190,26 @@ struct aon_voice {
 	uint8_t track_volume;
 };
 
+// AON8 Split soft voice. Art of Noise 8-channel pairs two voices per
+// Paula channel (base = voice/2); the four base channels' fixed hard pan
+// reproduces the stereo image. AON4 stays on the real hardware path.
+struct aon_softvoice {
+	int8_t *sample;
+	uint32_t length;
+	uint32_t loop_start;
+	uint32_t loop_length;          // 0 => one-shot
+	uint32_t pos;
+	uint32_t period;
+	uint64_t step_q;               // Q32 sample bytes per output sample
+	uint64_t step_acc;
+	int8_t *pending_sample;
+	uint32_t pending_pos;
+	uint32_t pending_length;
+	uint16_t volume;               // 0..64
+	uint8_t has_pending;
+	uint8_t active;
+};
+
 struct artofnoise_state {
 	struct paula paula;
 
@@ -239,6 +262,12 @@ struct artofnoise_state {
 	uint8_t restart_song;
 
 	struct aon_voice voices[AON_MAX_CHANNELS];
+
+	// AON8 full-software stereo submixer (see struct aon_softvoice).
+	struct aon_softvoice softv[AON_MAX_CHANNELS];
+	int8_t *softmix_buf;          // 4 contiguous n-sized base buffers
+	uint32_t softmix_cap;
+	int32_t softmix_period;
 };
 
 // [=]===^=[ aon_periods ]========================================================================[=]
@@ -383,13 +412,6 @@ static int8_t aon_nibble_tab[16] = {
 	0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1
 };
 
-// [=]===^=[ aon_pan4 ]===========================================================================[=]
-// Amiga LRRL: 0=L, 127=R
-static uint8_t aon_pan4[4] = { 0, 127, 127, 0 };
-
-// [=]===^=[ aon_pan8 ]===========================================================================[=]
-static uint8_t aon_pan8[8] = { 0, 0, 127, 127, 127, 127, 0, 0 };
-
 // [=]===^=[ aon_read_u32_be ]====================================================================[=]
 static uint32_t aon_read_u32_be(uint8_t *p) {
 	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | (uint32_t)p[3];
@@ -453,6 +475,7 @@ static void aon_cleanup(struct artofnoise_state *s) {
 	free(s->instruments); s->instruments = 0;
 	free(s->wave_forms); s->wave_forms = 0;
 	free(s->wave_form_lengths); s->wave_form_lengths = 0;
+	free(s->softmix_buf); s->softmix_buf = 0;
 }
 
 // [=]===^=[ aon_load ]===========================================================================[=]
@@ -1704,6 +1727,175 @@ static void aon_play_fx(struct artofnoise_state *s) {
 	}
 }
 
+// AON8 routes every voice through the software submixer; AON4 keeps the
+// real hardware path. These wrappers are the single routing point.
+// [=]===^=[ aon_is_soft ]========================================================================[=]
+static int32_t aon_is_soft(struct artofnoise_state *s) {
+	return s->module_type == 8;
+}
+
+// [=]===^=[ aon_pch_play_sample ]================================================================[=]
+static void aon_pch_play_sample(struct artofnoise_state *s, int32_t ch, int8_t *sample, uint32_t length) {
+	if(!aon_is_soft(s)) {
+		paula_play_sample(&s->paula, ch, sample, length);
+		return;
+	}
+	struct aon_softvoice *v = &s->softv[ch];
+	v->sample = sample;
+	v->length = length;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = 0;
+	v->step_acc = 0;
+	v->has_pending = 0;
+	v->pending_sample = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ aon_pch_queue_sample ]===============================================================[=]
+static void aon_pch_queue_sample(struct artofnoise_state *s, int32_t ch, int8_t *sample, uint32_t start_offset, uint32_t length) {
+	if(!aon_is_soft(s)) {
+		paula_queue_sample(&s->paula, ch, sample, start_offset, length);
+		return;
+	}
+	struct aon_softvoice *v = &s->softv[ch];
+	if(!v->active && sample != 0 && length > 0) {
+		v->sample = sample;
+		v->pos = start_offset;
+		v->length = start_offset + length;
+		v->step_acc = 0;
+		v->has_pending = 0;
+		v->pending_sample = 0;
+		v->active = 1;
+		return;
+	}
+	v->pending_sample = sample;
+	v->pending_pos = start_offset;
+	v->pending_length = start_offset + length;
+	v->has_pending = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ aon_pch_set_loop ]===================================================================[=]
+static void aon_pch_set_loop(struct artofnoise_state *s, int32_t ch, uint32_t start, uint32_t length) {
+	if(!aon_is_soft(s)) {
+		paula_set_loop(&s->paula, ch, start, length);
+		return;
+	}
+	struct aon_softvoice *v = &s->softv[ch];
+	v->loop_start = start;
+	v->loop_length = length;
+}
+
+// [=]===^=[ aon_pch_set_period ]=================================================================[=]
+static void aon_pch_set_period(struct artofnoise_state *s, int32_t ch, uint16_t period) {
+	if(!aon_is_soft(s)) {
+		paula_set_period(&s->paula, ch, period);
+		return;
+	}
+	s->softv[ch].period = period;
+}
+
+// [=]===^=[ aon_pch_set_volume ]=================================================================[=]
+static void aon_pch_set_volume(struct artofnoise_state *s, int32_t ch, uint16_t volume) {
+	if(!aon_is_soft(s)) {
+		paula_set_volume(&s->paula, ch, volume);
+		return;
+	}
+	if(volume > 64) {
+		volume = 64;
+	}
+	s->softv[ch].volume = volume;
+}
+
+// [=]===^=[ aon_softvoice_advance ]==============================================================[=]
+static void aon_softvoice_advance(struct aon_softvoice *v) {
+	uint32_t np = v->pos + 1;
+	if(np >= v->length) {
+		if(v->has_pending) {
+			v->sample = v->pending_sample;
+			np = v->pending_pos;
+			v->length = v->pending_length;
+			v->has_pending = 0;
+			v->pending_sample = 0;
+		} else if(v->loop_length > 0) {
+			uint32_t over = np - v->length;
+			np = v->loop_start + (over % v->loop_length);
+			v->length = v->loop_start + v->loop_length;
+		} else {
+			v->active = 0;
+			return;
+		}
+	}
+	v->pos = np;
+}
+
+// [=]===^=[ aon_softmix_refill ]=================================================================[=]
+// AON8 is a Split format: eight voices are paired two-per-Paula-channel
+// (base = voice/2), and the four base channels' fixed Paula hard pan
+// (ch0,3 = L, ch1,2 = R) reproduces aon_pan8 (voices {0,1}=L {2,3}=R
+// {4,5}=R {6,7}=L). Each base sums its two voices at half level (the
+// authentic 2-voices-per-channel quality loss) and is DMA'd through that
+// real Paula channel, so paula.h's resistive summer and analog chain give
+// the correct level. Four buffers, one per base, regenerated each tick.
+static void aon_softmix_refill(struct artofnoise_state *s) {
+	int32_t cp = s->softmix_period;
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)s->paula.samples_per_tick)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	if(n > s->softmix_cap) {
+		uint32_t nc = s->softmix_cap ? s->softmix_cap : 1024;
+		while(nc < n) {
+			nc <<= 1;
+		}
+		// One contiguous block, four n-sized base buffers.
+		int8_t *nb = (int8_t *)realloc(s->softmix_buf, (size_t)nc * 4);
+		if(!nb) {
+			return;
+		}
+		s->softmix_buf = nb;
+		s->softmix_cap = nc;
+	}
+	for(int32_t i = 0; i < AON_MAX_CHANNELS; ++i) {
+		struct aon_softvoice *v = &s->softv[i];
+		v->step_q = (v->period != 0)
+			? (((uint64_t)(uint32_t)cp << 32) / (uint64_t)v->period)
+			: 0;
+	}
+	for(int32_t b = 0; b < 4; ++b) {
+		int8_t *buf = s->softmix_buf + (size_t)b * s->softmix_cap;
+		for(uint32_t k = 0; k < n; ++k) {
+			int32_t sam = 0;
+			for(int32_t i = 2 * b; i < 2 * b + 2; ++i) {
+				struct aon_softvoice *v = &s->softv[i];
+				if(!v->active || v->sample == 0 || v->step_q == 0) {
+					continue;
+				}
+				// Split half-level so a pair can't exceed full scale.
+				sam += ((int32_t)v->sample[v->pos] * (int32_t)v->volume) / 128;
+				v->step_acc += v->step_q;
+				while(v->step_acc >= ((uint64_t)1 << 32)) {
+					v->step_acc -= ((uint64_t)1 << 32);
+					aon_softvoice_advance(v);
+					if(!v->active) {
+						break;
+					}
+				}
+			}
+			if(sam > 127) {
+				sam = 127;
+			}
+			if(sam < -128) {
+				sam = -128;
+			}
+			buf[k] = (int8_t)sam;
+		}
+		paula_play_sample(&s->paula, b, buf, n);
+		paula_set_loop(&s->paula, b, 0, n);
+		paula_set_period(&s->paula, b, (uint16_t)cp);
+		paula_set_volume(&s->paula, b, 64);
+	}
+}
+
 // [=]===^=[ aon_setup_channel ]==================================================================[=]
 static void aon_setup_channel(struct artofnoise_state *s, struct aon_voice *v, int32_t ch) {
 	if(v->fx_com == AON_FX_EXTRA && (uint8_t)(v->fx_dat & 0xf0) == AON_EX_NOTE_DELAY) {
@@ -1721,12 +1913,12 @@ static void aon_setup_channel(struct artofnoise_state *s, struct aon_voice *v, i
 
 		if(s->noise_avoid) {
 			if(v->old_wave_len > 255 || v->old_wave_len == 0 || v->wave_len > 255) {
-				paula_play_sample(&s->paula, ch, v->wave_form + v->wave_form_offset, length);
+				aon_pch_play_sample(s, ch, v->wave_form + v->wave_form_offset, length);
 			} else {
-				paula_queue_sample(&s->paula, ch, v->wave_form, v->wave_form_offset, length);
+				aon_pch_queue_sample(s, ch, v->wave_form, v->wave_form_offset, length);
 			}
 		} else {
-			paula_play_sample(&s->paula, ch, v->wave_form + v->wave_form_offset, length);
+			aon_pch_play_sample(s, ch, v->wave_form + v->wave_form_offset, length);
 		}
 
 		if(v->repeat_start != 0 && v->repeat_length > 1) {
@@ -1742,10 +1934,10 @@ static void aon_setup_channel(struct artofnoise_state *s, struct aon_voice *v, i
 				}
 			}
 			if(rlen > 0) {
-				paula_set_loop(&s->paula, ch, v->repeat_offset, rlen);
+				aon_pch_set_loop(s, ch, v->repeat_offset, rlen);
 			}
 		} else {
-			paula_set_loop(&s->paula, ch, 0, 0);
+			aon_pch_set_loop(s, ch, 0, 0);
 		}
 	} else {
 		if(v->repeat_start != 0 && v->repeat_length > 1) {
@@ -1761,8 +1953,8 @@ static void aon_setup_channel(struct artofnoise_state *s, struct aon_voice *v, i
 				}
 			}
 			if(rlen > 0) {
-				paula_queue_sample(&s->paula, ch, v->repeat_start, v->repeat_offset, rlen);
-				paula_set_loop(&s->paula, ch, v->repeat_offset, rlen);
+				aon_pch_queue_sample(s, ch, v->repeat_start, v->repeat_offset, rlen);
+				aon_pch_set_loop(s, ch, v->repeat_offset, rlen);
 			}
 		}
 	}
@@ -1771,10 +1963,10 @@ static void aon_setup_channel(struct artofnoise_state *s, struct aon_voice *v, i
 	if(period < 103) {
 		period = 103;
 	}
-	paula_set_period(&s->paula, ch, (uint16_t)period);
+	aon_pch_set_period(s, ch, (uint16_t)period);
 
 	uint16_t volume = (uint16_t)((((uint32_t)v->volume * (uint32_t)v->synth_vol) / 128) * (uint32_t)v->track_volume / 64);
-	paula_set_volume(&s->paula, ch, volume);
+	aon_pch_set_volume(s, ch, volume);
 
 	v->ch_flag = 0;
 }
@@ -1791,10 +1983,8 @@ static void aon_play(struct artofnoise_state *s) {
 
 	aon_play_fx(s);
 
-	uint8_t *pannings = (s->module_type == 8) ? aon_pan8 : aon_pan4;
 	for(int32_t i = 0; i < s->num_channels; ++i) {
 		aon_setup_channel(s, &s->voices[i], i);
-		s->paula.ch[i].pan = pannings[i];
 	}
 
 	if(s->end_reached) {
@@ -1838,7 +2028,11 @@ static struct artofnoise_state *artofnoise_init(void *data, uint32_t len, int32_
 	}
 
 	paula_init(&s->paula, sample_rate, AON_TICK_HZ);
+	s->softmix_period = AON_MIX_PERIOD;
 	aon_initialize_sound(s, 0);
+	if(s->module_type == 8) {
+		aon_softmix_refill(s);
+	}
 	return s;
 }
 
@@ -1865,6 +2059,9 @@ static void artofnoise_get_audio(struct artofnoise_state *s, float *output, int3
 		if(s->paula.tick_offset >= s->paula.samples_per_tick) {
 			s->paula.tick_offset = 0;
 			aon_play(s);
+			if(s->module_type == 8) {
+				aon_softmix_refill(s);
+			}
 		}
 	}
 }

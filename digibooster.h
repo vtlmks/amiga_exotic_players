@@ -23,6 +23,9 @@
 #define DIGIBOOSTER_NUM_ORDERS   128
 #define DIGIBOOSTER_PAT_ROWS     64
 #define DIGIBOOSTER_MAX_CHANNELS 8
+// Paula DMA period of a 5-8ch Split base channel's CPU submix.
+// Fidelity-only: each soft voice steps at its own pitch. A/B'd vs UADE.
+#define DIGIBOOSTER_MIX_PERIOD   320
 #define DIGIBOOSTER_ROBOT_BUFLEN 2500
 
 // Effects (high nibble of word 4 in the packed track-line).
@@ -125,6 +128,28 @@ struct digibooster_channel {
 	uint32_t start_offset;
 };
 
+// DigiBooster 1.x (.digi) Split soft voice. <=4 channel modules use the
+// real hardware path; 5-8 channel modules pair tracks two-per-Paula-
+// channel (base = channel/2) reproducing digibooster_pan's LLRRRRLL via
+// the four base channels' fixed hard pan. DigiBooster sums its voices
+// in software (no pre-attenuation).
+struct digibooster_softvoice {
+	int8_t *sample;
+	uint32_t length;
+	uint32_t loop_start;
+	uint32_t loop_length;          // 0 => one-shot
+	uint32_t pos;
+	uint32_t period;
+	uint64_t step_q;               // Q32 sample bytes per output sample
+	uint64_t step_acc;
+	int8_t *pending_sample;
+	uint32_t pending_pos;
+	uint32_t pending_length;
+	uint16_t volume;               // 0..64
+	uint8_t has_pending;
+	uint8_t active;
+};
+
 struct digibooster_state {
 	struct paula paula;
 
@@ -155,6 +180,13 @@ struct digibooster_state {
 	uint8_t pause_enabled;
 	uint8_t end_reached;
 	uint8_t amiga_filter;
+
+	// 5-8 channel Split submixer: 4 base buffers (one block), one per
+	// Paula channel, regenerated each tick from the soft voices.
+	struct digibooster_softvoice softv[DIGIBOOSTER_MAX_CHANNELS];
+	int8_t *softmix_buf;
+	uint32_t softmix_cap;
+	int32_t softmix_period;
 };
 
 // [=]===^=[ digibooster_periods ]================================================================[=]
@@ -201,9 +233,6 @@ static uint8_t digibooster_hex[100] = {
 	50, 51, 52, 53, 54, 55, 56, 57, 58, 59,  0,  0,  0,  0,  0,  0,
 	60, 61, 62, 63,
 };
-
-// LRRL panning for 8 channels, mapping NostalgicPlayer's panPos (Left=0, Right=127).
-static uint8_t digibooster_pan[8] = { 0, 0, 127, 127, 127, 127, 0, 0 };
 
 // [=]===^=[ digibooster_read_u16_be ]============================================================[=]
 static uint16_t digibooster_read_u16_be(uint8_t *p) {
@@ -439,7 +468,6 @@ static void digibooster_initialize_sound(struct digibooster_state *s) {
 	for(int32_t i = 0; i < DIGIBOOSTER_MAX_CHANNELS; ++i) {
 		memset(&s->channels[i], 0, sizeof(struct digibooster_channel));
 		memset(&s->current_row[i], 0, sizeof(struct digibooster_track_line));
-		s->paula.ch[i].pan = digibooster_pan[i];
 	}
 
 	digibooster_set_bpm_tempo(s, s->cia_tempo);
@@ -1180,6 +1208,180 @@ static void digibooster_parse_voice(struct digibooster_state *s, struct digiboos
 	}
 }
 
+// <=4 channel modules use the real hardware path; 5-8 channel modules
+// route every channel through a soft voice (base = chan/2). Single point.
+// [=]===^=[ dgb_is_soft ]========================================================================[=]
+static int32_t dgb_is_soft(struct digibooster_state *s) {
+	return s->number_of_channels > 4;
+}
+
+// [=]===^=[ dgb_pch_play_sample ]================================================================[=]
+static void dgb_pch_play_sample(struct digibooster_state *s, int32_t ci, int8_t *sample, uint32_t length) {
+	if(!dgb_is_soft(s)) {
+		paula_play_sample(&s->paula, ci, sample, length);
+		return;
+	}
+	struct digibooster_softvoice *v = &s->softv[ci];
+	v->sample = sample;
+	v->length = length;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = 0;
+	v->step_acc = 0;
+	v->has_pending = 0;
+	v->pending_sample = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ dgb_pch_queue_sample ]===============================================================[=]
+static void dgb_pch_queue_sample(struct digibooster_state *s, int32_t ci, int8_t *sample, uint32_t start_offset, uint32_t length) {
+	if(!dgb_is_soft(s)) {
+		paula_queue_sample(&s->paula, ci, sample, start_offset, length);
+		return;
+	}
+	struct digibooster_softvoice *v = &s->softv[ci];
+	if(!v->active && sample != 0 && length > 0) {
+		v->sample = sample;
+		v->pos = start_offset;
+		v->length = start_offset + length;
+		v->step_acc = 0;
+		v->has_pending = 0;
+		v->pending_sample = 0;
+		v->active = 1;
+		return;
+	}
+	v->pending_sample = sample;
+	v->pending_pos = start_offset;
+	v->pending_length = start_offset + length;
+	v->has_pending = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ dgb_pch_set_loop ]===================================================================[=]
+static void dgb_pch_set_loop(struct digibooster_state *s, int32_t ci, uint32_t start, uint32_t length) {
+	if(!dgb_is_soft(s)) {
+		paula_set_loop(&s->paula, ci, start, length);
+		return;
+	}
+	struct digibooster_softvoice *v = &s->softv[ci];
+	v->loop_start = start;
+	v->loop_length = length;
+}
+
+// [=]===^=[ dgb_pch_set_period ]=================================================================[=]
+static void dgb_pch_set_period(struct digibooster_state *s, int32_t ci, uint16_t period) {
+	if(!dgb_is_soft(s)) {
+		paula_set_period(&s->paula, ci, period);
+		return;
+	}
+	s->softv[ci].period = period;
+}
+
+// [=]===^=[ dgb_pch_set_volume ]=================================================================[=]
+static void dgb_pch_set_volume(struct digibooster_state *s, int32_t ci, uint16_t volume) {
+	if(!dgb_is_soft(s)) {
+		paula_set_volume(&s->paula, ci, volume);
+		return;
+	}
+	if(volume > 64) {
+		volume = 64;
+	}
+	s->softv[ci].volume = volume;
+}
+
+// [=]===^=[ dgb_pch_mute ]=======================================================================[=]
+static void dgb_pch_mute(struct digibooster_state *s, int32_t ci) {
+	if(!dgb_is_soft(s)) {
+		paula_mute(&s->paula, ci);
+		return;
+	}
+	s->softv[ci].active = 0;
+}
+
+// [=]===^=[ dgb_softvoice_advance ]==============================================================[=]
+static void dgb_softvoice_advance(struct digibooster_softvoice *v) {
+	uint32_t np = v->pos + 1;
+	if(np >= v->length) {
+		if(v->has_pending) {
+			v->sample = v->pending_sample;
+			np = v->pending_pos;
+			v->length = v->pending_length;
+			v->has_pending = 0;
+			v->pending_sample = 0;
+		} else if(v->loop_length > 0) {
+			uint32_t over = np - v->length;
+			np = v->loop_start + (over % v->loop_length);
+			v->length = v->loop_start + v->loop_length;
+		} else {
+			v->active = 0;
+			return;
+		}
+	}
+	v->pos = np;
+}
+
+// [=]===^=[ digibooster_softmix_refill ]=========================================================[=]
+// Regenerate the four Split base buffers (base = channel/2; the <=2
+// channels on a base summed without pre-attenuation) and arm Paula 0..3.
+static void digibooster_softmix_refill(struct digibooster_state *s) {
+	int32_t cp = s->softmix_period;
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)s->paula.samples_per_tick)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	if(n > s->softmix_cap) {
+		uint32_t nc = s->softmix_cap ? s->softmix_cap : 1024;
+		while(nc < n) {
+			nc <<= 1;
+		}
+		int8_t *nb = (int8_t *)realloc(s->softmix_buf, (size_t)nc * 4);
+		if(!nb) {
+			return;
+		}
+		s->softmix_buf = nb;
+		s->softmix_cap = nc;
+	}
+	for(int32_t i = 0; i < DIGIBOOSTER_MAX_CHANNELS; ++i) {
+		struct digibooster_softvoice *v = &s->softv[i];
+		v->step_q = (v->period != 0)
+			? (((uint64_t)(uint32_t)cp << 32) / (uint64_t)v->period)
+			: 0;
+	}
+	for(int32_t b = 0; b < 4; ++b) {
+		int8_t *buf = s->softmix_buf + (size_t)b * s->softmix_cap;
+		for(uint32_t k = 0; k < n; ++k) {
+			int32_t sam = 0;
+			for(int32_t i = 2 * b; i < 2 * b + 2 && i < (int32_t)s->number_of_channels; ++i) {
+				struct digibooster_softvoice *v = &s->softv[i];
+				if(!v->active || v->sample == 0 || v->step_q == 0) {
+					continue;
+				}
+				// DigiBooster's software mixer applies a ~3/4 master gain
+				// (derived by A/B vs UADE: the raw sum runs ~1.35x hot at
+				// a consistent ratio across modules).
+				sam += ((int32_t)v->sample[v->pos] * (int32_t)v->volume * 3) / 256;
+				v->step_acc += v->step_q;
+				while(v->step_acc >= ((uint64_t)1 << 32)) {
+					v->step_acc -= ((uint64_t)1 << 32);
+					dgb_softvoice_advance(v);
+					if(!v->active) {
+						break;
+					}
+				}
+			}
+			if(sam > 127) {
+				sam = 127;
+			}
+			if(sam < -128) {
+				sam = -128;
+			}
+			buf[k] = (int8_t)sam;
+		}
+		paula_play_sample(&s->paula, b, buf, n);
+		paula_set_loop(&s->paula, b, 0, n);
+		paula_set_period(&s->paula, b, (uint16_t)cp);
+		paula_set_volume(&s->paula, b, 64);
+	}
+}
+
 // [=]===^=[ digibooster_play_voice ]=============================================================[=]
 static void digibooster_play_voice(struct digibooster_state *s, struct digibooster_channel *ch, int32_t chan_idx) {
 	if(ch->main_period != 0) {
@@ -1195,26 +1397,26 @@ static void digibooster_play_voice(struct digibooster_state *s, struct digiboost
 		}
 
 		if(ch->main_period == -1) {
-			paula_mute(&s->paula, chan_idx);
+			dgb_pch_mute(s, chan_idx);
 			ch->play_pointer = 1;
 			ch->main_period = 0;
 		} else {
-			paula_set_period(&s->paula, chan_idx, (uint16_t)ch->main_period);
+			dgb_pch_set_period(s, chan_idx, (uint16_t)ch->main_period);
 			uint8_t vol = ch->main_volume;
 			if(vol > 64) {
 				vol = 64;
 			}
-			paula_set_volume(&s->paula, chan_idx, vol);
+			dgb_pch_set_volume(s, chan_idx, vol);
 
 			if(ch->robot_enable) {
 				int8_t *buf = ch->robot_buffers[0];
 				uint32_t play_len = (uint32_t)ch->robot_bytes_to_play;
 				if(retrig) {
-					paula_play_sample(&s->paula, chan_idx, buf, play_len);
+					dgb_pch_play_sample(s, chan_idx, buf, play_len);
 				} else {
-					paula_queue_sample(&s->paula, chan_idx, buf, 0, play_len);
+					dgb_pch_queue_sample(s, chan_idx, buf, 0, play_len);
 				}
-				paula_set_loop(&s->paula, chan_idx, 0, play_len);
+				dgb_pch_set_loop(s, chan_idx, 0, play_len);
 
 				int8_t *tmp = ch->robot_buffers[0];
 				ch->robot_buffers[0] = ch->robot_buffers[1];
@@ -1224,27 +1426,27 @@ static void digibooster_play_voice(struct digibooster_state *s, struct digiboost
 					struct digibooster_sample *sm = &s->samples[ch->old_sample_number - 1];
 					if(ch->backward_enabled != 0) {
 						// Backwards playback would need a Paula extension; play forward as a fallback.
-						paula_play_sample(&s->paula, chan_idx, ch->sample_data, sm->length);
+						dgb_pch_play_sample(s, chan_idx, ch->sample_data, sm->length);
 						if(ch->backward_enabled == 2 && sm->loop_length > 0) {
-							paula_set_loop(&s->paula, chan_idx, sm->loop_start, sm->loop_length);
+							dgb_pch_set_loop(s, chan_idx, sm->loop_start, sm->loop_length);
 						} else {
-							paula_set_loop(&s->paula, chan_idx, 0, 0);
+							dgb_pch_set_loop(s, chan_idx, 0, 0);
 						}
 					} else {
 						uint32_t length = sm->length - ch->start_offset;
 						if(length > 0 && ch->sample_data) {
-							paula_play_sample(&s->paula, chan_idx, ch->sample_data + ch->start_offset, length);
+							dgb_pch_play_sample(s, chan_idx, ch->sample_data + ch->start_offset, length);
 							if(sm->loop_length > 0) {
-								paula_set_loop(&s->paula, chan_idx, sm->loop_start, sm->loop_length);
+								dgb_pch_set_loop(s, chan_idx, sm->loop_start, sm->loop_length);
 							} else {
-								paula_set_loop(&s->paula, chan_idx, 0, 0);
+								dgb_pch_set_loop(s, chan_idx, 0, 0);
 							}
 						} else {
 							if(sm->loop_length > 0 && ch->sample_data) {
-								paula_play_sample(&s->paula, chan_idx, ch->sample_data + sm->loop_start, sm->loop_length);
-								paula_set_loop(&s->paula, chan_idx, 0, sm->loop_length);
+								dgb_pch_play_sample(s, chan_idx, ch->sample_data + sm->loop_start, sm->loop_length);
+								dgb_pch_set_loop(s, chan_idx, 0, sm->loop_length);
 							} else {
-								paula_mute(&s->paula, chan_idx);
+								dgb_pch_mute(s, chan_idx);
 							}
 						}
 					}
@@ -1327,6 +1529,8 @@ static void digibooster_cleanup(struct digibooster_state *s) {
 			s->robot_storage[i][1] = 0;
 		}
 	}
+	free(s->softmix_buf);
+	s->softmix_buf = 0;
 }
 
 // [=]===^=[ digibooster_init ]===================================================================[=]
@@ -1352,7 +1556,11 @@ static struct digibooster_state *digibooster_init(void *data, uint32_t len, int3
 	}
 
 	paula_init(&s->paula, sample_rate, DIGIBOOSTER_BASE_TICK_HZ);
+	s->softmix_period = DIGIBOOSTER_MIX_PERIOD;
 	digibooster_initialize_sound(s);
+	if(s->number_of_channels > 4) {
+		digibooster_softmix_refill(s);
+	}
 	return s;
 }
 
@@ -1379,6 +1587,9 @@ static void digibooster_get_audio(struct digibooster_state *s, float *output, in
 		if(s->paula.tick_offset >= s->paula.samples_per_tick) {
 			s->paula.tick_offset = 0;
 			digibooster_tick(s);
+			if(s->number_of_channels > 4) {
+				digibooster_softmix_refill(s);
+			}
 		}
 	}
 }

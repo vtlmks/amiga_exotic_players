@@ -24,7 +24,11 @@
 #include "player_api.h"
 
 #define DW_TICK_HZ          50
-#define DW_MAX_CHANNELS     8
+// David Whittaker's Amiga driver is a 4-voice format: every known module
+// uses 3 or 4 channels, mapped 1:1 onto Paula's four hard-panned channels.
+// The cap is 4 so a malformed header can never index a non-existent Paula
+// channel; real modules are unaffected.
+#define DW_MAX_CHANNELS     4
 #define DW_SCAN_BUFFER_LEN  16384
 
 enum {

@@ -28,6 +28,12 @@
 #include "player_api.h"
 
 #define HIP_TICK_HZ          50
+// Paula DMA period of the 7-voice ch3 software-mix output. The original
+// replayer stores this per module (libtfmx: trackTable+1); our NP-derived
+// loader does not parse that table. It is a fidelity parameter only -- each
+// soft voice steps at its own pitch so tuning it does not move pitch -- and
+// is A/B'd against UADE's JochenHippel-7V (~11 kHz mix).
+#define HIP_7V_CH3_PERIOD    320
 #define HIP_MAX_CHANNELS     7
 
 enum {
@@ -81,6 +87,29 @@ struct hip_global_playing_info {
 	uint16_t speed_counter;
 	uint16_t speed;
 	uint16_t random;
+};
+
+// Hybrid-7V soft voice. In 7-voice modules three voices play directly on
+// Paula channels 0,1,2; the other four are summed by the CPU into a single
+// buffer DMA'd through Paula channel 3 (the Hippel/Huelsbeck design). Each
+// soft voice keeps its own DMA-style playback state; the mix law is the one
+// the original replayer uses (libtfmxaudiodecoder getSample_7V): per output
+// sample, sum (sample*volume/64) of the four, then hard-clamp to int8.
+struct hip_softvoice {
+	int8_t *sample;
+	uint32_t length;               // bytes (== loop_start+loop_length after first wrap)
+	uint32_t loop_start;
+	uint32_t loop_length;          // 0 => one-shot
+	uint32_t pos;
+	uint32_t period;               // Paula period (pitch); step derived at refill
+	uint64_t step_q;               // sample bytes per ch3 output sample, Q32
+	uint64_t step_acc;             // Q32
+	int8_t *pending_sample;
+	uint32_t pending_pos;
+	uint32_t pending_length;
+	uint16_t volume;               // 0..64
+	uint8_t has_pending;
+	uint8_t active;
 };
 
 struct hip_voice_info {
@@ -210,6 +239,12 @@ struct hippel_state {
 
 	float playing_frequency;       // tempo for 7-voice variant
 	uint8_t end_reached;
+
+	// Hybrid-7V CPU submixer (only used when number_of_channels == 7).
+	struct hip_softvoice softv[4]; // logical voices 3..6 -> softv[0..3]
+	int8_t *softmix_buf;           // ch3 DMA buffer, regenerated each tick
+	uint32_t softmix_cap;          // allocated bytes of softmix_buf
+	int32_t softmix_period;        // fixed Paula period of the ch3 mix DMA
 };
 
 // [=]===^=[ hip_default_command_table ]==========================================================[=]
@@ -235,12 +270,6 @@ static uint16_t hip_periods2[] = {
 	 113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,  113,
 	3424, 3232, 3048, 2880, 2712, 2560, 2416, 2280, 2152, 2032, 1920, 1812
 };
-
-// [=]===^=[ hip_pan4 ]===========================================================================[=]
-static uint8_t hip_pan4[] = { 0, 127, 127, 0 };
-
-// [=]===^=[ hip_pan7 ]===========================================================================[=]
-static uint8_t hip_pan7[] = { 0, 127, 127, 0, 0, 0, 0 };
 
 // [=]===^=[ hip_read_b_u16 ]=====================================================================[=]
 static uint16_t hip_read_b_u16(uint8_t *p) {
@@ -284,6 +313,204 @@ static void hip_play_sample_at(struct paula *p, int32_t idx, int8_t *sample, uin
 	if(length > 0) {
 		paula_set_pos(p, idx, start_offset);
 	}
+}
+
+// In 7-voice modules logical voices 3..6 are not real Paula channels: they
+// are CPU-summed into Paula channel 3. These wrappers route voices 0..2 to
+// the real hardware channels and voices 3..6 to soft-voice state; 4-voice
+// (plain/COSO) modules always use the real channels. is_soft() is the single
+// predicate; everything below funnels through it.
+// [=]===^=[ hip_is_soft ]========================================================================[=]
+static int32_t hip_is_soft(struct hippel_state *s, int32_t voice) {
+	return (s->module_type == HIP_TYPE_HIPPEL_7V) && (voice >= 3);
+}
+
+// [=]===^=[ hip_pch_play_sample ]================================================================[=]
+static void hip_pch_play_sample(struct hippel_state *s, int32_t voice, int8_t *sample, uint32_t length) {
+	if(!hip_is_soft(s, voice)) {
+		paula_play_sample(&s->paula, voice, sample, length);
+		return;
+	}
+	struct hip_softvoice *v = &s->softv[voice - 3];
+	v->sample = sample;
+	v->length = length;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = 0;
+	v->step_acc = 0;
+	v->has_pending = 0;
+	v->pending_sample = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ hip_pch_play_sample_at ]=============================================================[=]
+static void hip_pch_play_sample_at(struct hippel_state *s, int32_t voice, int8_t *sample, uint32_t start_offset, uint32_t length) {
+	if(!hip_is_soft(s, voice)) {
+		hip_play_sample_at(&s->paula, voice, sample, start_offset, length);
+		return;
+	}
+	struct hip_softvoice *v = &s->softv[voice - 3];
+	v->sample = sample;
+	v->length = length > 0 ? start_offset + length : 0;
+	v->loop_start = 0;
+	v->loop_length = 0;
+	v->pos = start_offset;
+	v->step_acc = 0;
+	v->has_pending = 0;
+	v->pending_sample = 0;
+	v->active = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ hip_pch_queue_sample ]===============================================================[=]
+static void hip_pch_queue_sample(struct hippel_state *s, int32_t voice, int8_t *sample, uint32_t start_offset, uint32_t length) {
+	if(!hip_is_soft(s, voice)) {
+		paula_queue_sample(&s->paula, voice, sample, start_offset, length);
+		return;
+	}
+	struct hip_softvoice *v = &s->softv[voice - 3];
+	if(!v->active && sample != 0 && length > 0) {
+		v->sample = sample;
+		v->pos = start_offset;
+		v->length = start_offset + length;
+		v->step_acc = 0;
+		v->has_pending = 0;
+		v->pending_sample = 0;
+		v->active = 1;
+		return;
+	}
+	v->pending_sample = sample;
+	v->pending_pos = start_offset;
+	v->pending_length = start_offset + length;
+	v->has_pending = (sample != 0) && (length > 0);
+}
+
+// [=]===^=[ hip_pch_set_loop ]===================================================================[=]
+static void hip_pch_set_loop(struct hippel_state *s, int32_t voice, uint32_t start, uint32_t length) {
+	if(!hip_is_soft(s, voice)) {
+		paula_set_loop(&s->paula, voice, start, length);
+		return;
+	}
+	struct hip_softvoice *v = &s->softv[voice - 3];
+	v->loop_start = start;
+	v->loop_length = length;
+}
+
+// [=]===^=[ hip_pch_set_period ]=================================================================[=]
+static void hip_pch_set_period(struct hippel_state *s, int32_t voice, uint16_t period) {
+	if(!hip_is_soft(s, voice)) {
+		paula_set_period(&s->paula, voice, period);
+		return;
+	}
+	s->softv[voice - 3].period = period;
+}
+
+// [=]===^=[ hip_pch_set_volume ]=================================================================[=]
+static void hip_pch_set_volume(struct hippel_state *s, int32_t voice, uint16_t volume) {
+	if(!hip_is_soft(s, voice)) {
+		paula_set_volume(&s->paula, voice, volume);
+		return;
+	}
+	if(volume > 64) {
+		volume = 64;
+	}
+	s->softv[voice - 3].volume = volume;
+}
+
+// [=]===^=[ hip_pch_mute ]=======================================================================[=]
+static void hip_pch_mute(struct hippel_state *s, int32_t voice) {
+	if(!hip_is_soft(s, voice)) {
+		paula_mute(&s->paula, voice);
+		return;
+	}
+	s->softv[voice - 3].active = 0;
+}
+
+// [=]===^=[ hip_softvoice_advance ]==============================================================[=]
+// Consume one sample byte for a soft voice: pending swap / loop wrap /
+// one-shot stop, exactly as Paula DMA does.
+static void hip_softvoice_advance(struct hip_softvoice *v) {
+	uint32_t np = v->pos + 1;
+	if(np >= v->length) {
+		if(v->has_pending) {
+			v->sample = v->pending_sample;
+			np = v->pending_pos;
+			v->length = v->pending_length;
+			v->has_pending = 0;
+			v->pending_sample = 0;
+		} else if(v->loop_length > 0) {
+			uint32_t over = np - v->length;
+			np = v->loop_start + (over % v->loop_length);
+			v->length = v->loop_start + v->loop_length;
+		} else {
+			v->active = 0;
+			return;
+		}
+	}
+	v->pos = np;
+}
+
+// [=]===^=[ hip_softmix_refill ]=================================================================[=]
+// Regenerate Paula channel 3's DMA buffer from the four soft voices for the
+// upcoming player tick and (re)arm channel 3. Mix law from the original 7V
+// replayer (libtfmxaudiodecoder LamePaulaMixer::getSample_7V): per output
+// sample, sum (int8 sample * volume / 64) over the four soft voices, then
+// hard-clamp the total to signed 8-bit. Per-voice volume is baked in, so
+// channel 3 itself runs at full volume. The ch3 DMA period is fidelity-only
+// (each soft voice steps at its own pitch); pitch is period-independent.
+static void hip_softmix_refill(struct hippel_state *s) {
+	int32_t cp = s->softmix_period;
+	// ch3 samples for one tick = mix_rate / tick_rate. mix_rate =
+	// clock/cp, tick_rate = sample_rate/samples_per_tick.
+	uint64_t n64 = ((uint64_t)s->paula.clock * (uint64_t)s->paula.samples_per_tick)
+		/ ((uint64_t)cp * (uint64_t)s->paula.sample_rate);
+	uint32_t n = (uint32_t)n64 + 2;
+	if(n > s->softmix_cap) {
+		uint32_t nc = s->softmix_cap ? s->softmix_cap : 1024;
+		while(nc < n) {
+			nc <<= 1;
+		}
+		int8_t *nb = (int8_t *)realloc(s->softmix_buf, nc);
+		if(!nb) {
+			return;
+		}
+		s->softmix_buf = nb;
+		s->softmix_cap = nc;
+	}
+	for(int32_t i = 0; i < 4; ++i) {
+		struct hip_softvoice *v = &s->softv[i];
+		v->step_q = (v->period != 0)
+			? (((uint64_t)(uint32_t)cp << 32) / (uint64_t)v->period)
+			: 0;
+	}
+	for(uint32_t k = 0; k < n; ++k) {
+		int32_t sam = 0;
+		for(int32_t i = 0; i < 4; ++i) {
+			struct hip_softvoice *v = &s->softv[i];
+			if(!v->active || v->sample == 0 || v->step_q == 0) {
+				continue;
+			}
+			sam += ((int32_t)v->sample[v->pos] * (int32_t)v->volume) / 64;
+			v->step_acc += v->step_q;
+			while(v->step_acc >= ((uint64_t)1 << 32)) {
+				v->step_acc -= ((uint64_t)1 << 32);
+				hip_softvoice_advance(v);
+				if(!v->active) {
+					break;
+				}
+			}
+		}
+		if(sam > 127) {
+			sam = 127;
+		}
+		if(sam < -128) {
+			sam = -128;
+		}
+		s->softmix_buf[k] = (int8_t)sam;
+	}
+	paula_play_sample(&s->paula, 3, s->softmix_buf, n);
+	paula_set_loop(&s->paula, 3, 0, n);
+	paula_set_period(&s->paula, 3, (uint16_t)cp);
+	paula_set_volume(&s->paula, 3, 64);
 }
 
 // [=]===^=[ hip_has_7voices_structures ]=========================================================[=]
@@ -1584,7 +1811,7 @@ static void hip_setup_envelope(struct hippel_state *s, int32_t voice) {
 	struct hip_voice_info *vi = &s->voices[voice];
 
 	if(s->enable_mute) {
-		paula_mute(&s->paula, voice);
+		hip_pch_mute(s, voice);
 	}
 
 	uint8_t val = (uint8_t)((vi->current_info & 0x1f) + (uint32_t)vi->envelope_transpose);
@@ -1918,7 +2145,7 @@ static void hip_read_next_row_coso(struct hippel_state *s, int32_t voice) {
 
 				if(val < 128) {
 					if(s->enable_mute) {
-						paula_mute(&s->paula, voice);
+						hip_pch_mute(s, voice);
 					}
 
 					uint8_t val_e = (uint8_t)((vi->current_info & 0x1f) + (uint32_t)vi->envelope_transpose);
@@ -2235,11 +2462,11 @@ static void hip_parse_effects(struct hippel_state *s, int32_t voice) {
 									vi->volume_variation_depth = 0;
 									vi->sample = 0xff;
 									struct hip_sample *sm = &s->samples[sample_number];
-									paula_play_sample(&s->paula, voice, sm->sample_data, sm->length);
+									hip_pch_play_sample(s, voice, sm->sample_data, sm->length);
 									if(sm->loop_length > 2) {
-										paula_set_loop(&s->paula, voice, sm->loop_start, sm->loop_length);
+										hip_pch_set_loop(s, voice, sm->loop_start, sm->loop_length);
 									} else {
-										paula_set_loop(&s->paula, voice, 0, 0);
+										hip_pch_set_loop(s, voice, 0, 0);
 									}
 									vi->envelope_position = 0;
 									vi->envelope_counter = 1;
@@ -2272,11 +2499,11 @@ static void hip_parse_effects(struct hippel_state *s, int32_t voice) {
 									struct hip_sample *sm = &s->samples[sample_number];
 									uint32_t loop_len = (sm->loop_length > 2) ? sm->loop_length : sm->length;
 									uint32_t loop_start = (sm->loop_length > 2) ? sm->loop_start : 0;
-									paula_queue_sample(&s->paula, voice, sm->sample_data, loop_start, loop_len);
+									hip_pch_queue_sample(s, voice, sm->sample_data, loop_start, loop_len);
 									if(sm->loop_length > 2) {
-										paula_set_loop(&s->paula, voice, sm->loop_start, sm->loop_length);
+										hip_pch_set_loop(s, voice, sm->loop_start, sm->loop_length);
 									} else {
-										paula_set_loop(&s->paula, voice, 0, sm->length);
+										hip_pch_set_loop(s, voice, 0, sm->length);
 									}
 									vi->slide = 0;
 								}
@@ -2303,19 +2530,19 @@ static void hip_parse_effects(struct hippel_state *s, int32_t voice) {
 								uint32_t offset = (uint32_t)vi->frequency_table[vi->frequency_position + 2] * sm->loop_length;
 								uint32_t play_len = (sm->loop_length > offset) ? (sm->loop_length - offset) : 0;
 								if(play_len > 0) {
-									hip_play_sample_at(&s->paula, voice, sm->sample_data, offset, play_len);
+									hip_pch_play_sample_at(s, voice, sm->sample_data, offset, play_len);
 								} else {
-									paula_play_sample(&s->paula, voice, sm->sample_data, sm->length);
+									hip_pch_play_sample(s, voice, sm->sample_data, sm->length);
 								}
 								if(sm->loop_length > 2) {
-									paula_set_loop(&s->paula, voice, sm->loop_start, sm->loop_length);
+									hip_pch_set_loop(s, voice, sm->loop_start, sm->loop_length);
 								} else {
-									paula_set_loop(&s->paula, voice, 0, 0);
+									hip_pch_set_loop(s, voice, 0, 0);
 								}
 							}
 							vi->frequency_position += 3;
 						} else if(s->effects_enabled[5] == 2) {
-							paula_mute(&s->paula, voice);
+							hip_pch_mute(s, voice);
 							vi->volume_variation_depth = 0;
 							vi->slide_sample = sample_number;
 							vi->slide_end_position = (int32_t)sm->length;
@@ -2383,11 +2610,11 @@ static void hip_parse_effects(struct hippel_state *s, int32_t voice) {
 								if((sample_number < s->samples_count) && (vi->sample != sample_number)) {
 									vi->sample = sample_number;
 									struct hip_sample *sm = &s->samples[sample_number];
-									paula_play_sample(&s->paula, voice, sm->sample_data, sm->length);
+									hip_pch_play_sample(s, voice, sm->sample_data, sm->length);
 									if(sm->loop_length > 2) {
-										paula_set_loop(&s->paula, voice, sm->loop_start, sm->loop_length);
+										hip_pch_set_loop(s, voice, sm->loop_start, sm->loop_length);
 									} else {
-										paula_set_loop(&s->paula, voice, 0, 0);
+										hip_pch_set_loop(s, voice, 0, 0);
 									}
 								}
 							}
@@ -2460,8 +2687,8 @@ static void hip_parse_effects(struct hippel_state *s, int32_t voice) {
 												length = (int32_t)(sd_len - sample_start_offset);
 											}
 											if(length > 0) {
-												hip_play_sample_at(&s->paula, voice, sd, sample_start_offset, (uint32_t)length);
-												paula_set_loop(&s->paula, voice, sample_start_offset, (uint32_t)length);
+												hip_pch_play_sample_at(s, voice, sd, sample_start_offset, (uint32_t)length);
+												hip_pch_set_loop(s, voice, sample_start_offset, (uint32_t)length);
 											}
 
 											vi->envelope_position = 0;
@@ -2545,8 +2772,8 @@ static void hip_run_effects(struct hippel_state *s, int32_t voice) {
 					len = (start <= sm->length) ? (sm->length - start) : 0;
 				}
 				if(sm->sample_data && (len > 0)) {
-					paula_queue_sample(&s->paula, voice, sm->sample_data, start, len);
-					paula_set_loop(&s->paula, voice, start, len);
+					hip_pch_queue_sample(s, voice, sm->sample_data, start, len);
+					hip_pch_set_loop(s, voice, start, len);
 				}
 			}
 		}
@@ -2635,7 +2862,7 @@ static void hip_run_effects(struct hippel_state *s, int32_t voice) {
 		period = hip_do_portamento_v2(vi, period);
 	}
 
-	paula_set_period(&s->paula, voice, period);
+	hip_pch_set_period(s, voice, period);
 
 	uint16_t out_volume;
 	if(s->enable_volume_fade) {
@@ -2661,23 +2888,22 @@ static void hip_run_effects(struct hippel_state *s, int32_t voice) {
 		out_volume = vi->volume;
 	}
 
-	paula_set_volume(&s->paula, voice, out_volume);
+	hip_pch_set_volume(s, voice, out_volume);
 }
 
 // [=]===^=[ hip_do_effects ]=====================================================================[=]
 static void hip_do_effects(struct hippel_state *s, int32_t voice) {
 	hip_parse_effects(s, voice);
 	hip_run_effects(s, voice);
-
-	uint8_t pan = (s->number_of_channels == 7) ? hip_pan7[voice] : hip_pan4[voice];
-	s->paula.ch[voice].pan = pan;
 }
 
 // [=]===^=[ hip_play ]===========================================================================[=]
 static void hip_play(struct hippel_state *s) {
 	--s->playing_info.speed_counter;
 
-	int32_t max_voice = (s->number_of_channels < PAULA_NUM_CHANNELS) ? s->number_of_channels : PAULA_NUM_CHANNELS;
+	// All logical voices are processed; voices 0..2 drive Paula 0..2, voices
+	// 3..6 (7V only) are CPU-summed into Paula channel 3 (see hip_pch_*).
+	int32_t max_voice = s->number_of_channels;
 
 	if(s->playing_info.speed_counter == 0) {
 		s->playing_info.speed_counter = s->playing_info.speed;
@@ -2736,6 +2962,11 @@ static void hip_cleanup(struct hippel_state *s) {
 		free(s->position_list);
 		s->position_list = 0;
 	}
+	if(s->softmix_buf) {
+		free(s->softmix_buf);
+		s->softmix_buf = 0;
+		s->softmix_cap = 0;
+	}
 	if(s->position_visited) {
 		free(s->position_visited);
 		s->position_visited = 0;
@@ -2787,7 +3018,13 @@ static struct hippel_state *hippel_init(void *data, uint32_t len, int32_t sample
 	}
 
 	paula_init(&s->paula, sample_rate, HIP_TICK_HZ);
+	// Fixed Paula period of the 7V ch3 mix DMA. Fidelity-only (each soft
+	// voice steps at its own pitch); A/B'd against UADE's JochenHippel-7V.
+	s->softmix_period = HIP_7V_CH3_PERIOD;
 	hip_initialize_sound(s, 0);
+	if(s->module_type == HIP_TYPE_HIPPEL_7V) {
+		hip_softmix_refill(s);
+	}
 	return s;
 }
 
@@ -2814,6 +3051,9 @@ static void hippel_get_audio(struct hippel_state *s, float *output, int32_t fram
 		if(s->paula.tick_offset >= s->paula.samples_per_tick) {
 			s->paula.tick_offset = 0;
 			hip_play(s);
+			if(s->module_type == HIP_TYPE_HIPPEL_7V) {
+				hip_softmix_refill(s);
+			}
 		}
 	}
 }
