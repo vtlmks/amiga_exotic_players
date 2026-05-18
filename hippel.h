@@ -280,15 +280,10 @@ static int32_t hip_bounded(struct hippel_state *s, uint32_t off, uint32_t len) {
 // looping. Loop bounds (set via paula_set_loop) reference absolute offsets
 // in the same buffer.
 static void hip_play_sample_at(struct paula *p, int32_t idx, int8_t *sample, uint32_t start_offset, uint32_t length) {
-	struct paula_channel *c = &p->ch[idx];
-	c->sample = sample;
-	c->length_fp = (start_offset + length) << PAULA_FP_SHIFT;
-	c->pos_fp = start_offset << PAULA_FP_SHIFT;
-	c->loop_start_fp = 0;
-	c->loop_length_fp = 0;
-	c->has_pending = 0;
-	c->pending_sample = 0;
-	c->active = (sample != 0) && (length > 0);
+	paula_play_sample(p, idx, sample, length > 0 ? start_offset + length : 0);
+	if(length > 0) {
+		paula_set_pos(p, idx, start_offset);
+	}
 }
 
 // [=]===^=[ hip_has_7voices_structures ]=========================================================[=]

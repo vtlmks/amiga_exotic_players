@@ -487,7 +487,10 @@ static int32_t ftm_load_sample_names(struct facethemusic_state *s, uint32_t *pos
 		uint8_t has_name = 0;
 		for(uint32_t k = 0; k < 29; ++k) {
 			uint8_t c = data[pos + k];
-			if(c != 0 && c != ' ') {
+			if(c == 0) {
+				break;
+			}
+			if(c != ' ') {
 				has_name = 1;
 				break;
 			}
@@ -1838,7 +1841,7 @@ static void ftm_setup_hardware(struct facethemusic_state *s) {
 			v->retrig_sample = 0;
 			uint32_t play_len = (v->sample_total_length > v->sample_start_offset) ? (v->sample_total_length - v->sample_start_offset) : 0;
 			paula_play_sample(&s->paula, paula_ch, v->sample_data, v->sample_start_offset + play_len);
-			s->paula.ch[paula_ch].pos_fp = v->sample_start_offset << PAULA_FP_SHIFT;
+			paula_set_pos(&s->paula, paula_ch, v->sample_start_offset);
 			if(v->sample_loop_length != 0) {
 				paula_set_loop(&s->paula, paula_ch, v->sample_loop_start, (uint32_t)v->sample_loop_length * 2U);
 			} else {

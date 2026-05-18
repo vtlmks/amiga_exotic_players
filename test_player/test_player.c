@@ -59,6 +59,7 @@
 #include "../hivelytracker.h"
 #include "../fashiontracker.h"
 #include "../soundtracker.h"
+#include "../protracker.h"
 
 #define SAMPLE_RATE       48000
 #define NUM_CHANNELS      2
@@ -108,6 +109,7 @@ static struct player_api *g_players[] = {
 	&hivelytracker_api,
 	&fashiontracker_api,
 	&soundtracker_api,
+	&protracker_api,
 	0,
 };
 
@@ -500,6 +502,20 @@ int main(int argc, char **argv) {
 			}
 		}
 
+		// Final output saturation. Players accumulate without clamping (an
+		// Amiga sums channels hot and clips in the analog stage); the host
+		// is contractually the final saturation point, so do it here rather
+		// than let ALSA hard-clip or wrap the out-of-range floats.
+		for(int32_t i = 0; i < FRAMES_PER_PERIOD * NUM_CHANNELS; ++i) {
+			float v = fbuffer[i];
+			if(v > 1.0f) {
+				v = 1.0f;
+			} else if(v < -1.0f) {
+				v = -1.0f;
+			}
+			fbuffer[i] = v;
+		}
+
 		snd_pcm_sframes_t written = snd_pcm_writei(pcm, fbuffer, FRAMES_PER_PERIOD);
 		if(written < 0) {
 			if(snd_pcm_recover(pcm, (int)written, 1) < 0) {
@@ -510,6 +526,11 @@ int main(int argc, char **argv) {
 	}
 
 	fprintf(stdout, "\nshutting down\n");
+#ifdef PAULA_PROFILE
+	if(getenv("PAULA_PROFILE")) {
+		paula_profile_report(SAMPLE_RATE);
+	}
+#endif
 	snd_pcm_drop(pcm);
 	snd_pcm_close(pcm);
 	free(fbuffer);

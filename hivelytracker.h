@@ -10,6 +10,21 @@
 // includes its own internal mixer.
 //
 // Notes / known limitations:
+//  - KNOWN FIDELITY GAP (Paula coloration missing): on a real Amiga, AHX/HVL
+//    is CPU-mixed into Paula's 4 channels and then goes through Paula's volume
+//    PWM, zero-order-hold staircase, the resistive summer, and the analog
+//    filter/amp chain. This port does NOT model that: it mixes its voices in
+//    float at the host output rate and the result is summed into the output
+//    bus AFTER paula.h's filters, so it gets none of the Paula staircase,
+//    PWM, summer or A500 filter/amp coloration. It bypasses the Paula path
+//    deliberately, because AHX needs per-instrument STEREO panning that
+//    Paula's hard 0+3/1+2 mono-per-side routing physically cannot produce --
+//    so the mixdown must happen before Paula on real hardware too. A fully
+//    faithful fix requires rewriting this replayer to emit per-Paula-channel
+//    8-bit streams (not pre-mixed stereo) and feed them through paula.h; the
+//    current pre-mixed, bandwidth-limited stereo cannot be pushed through the
+//    staircase model meaningfully. This is a separate, larger task; until
+//    then the AHX/HVL output is NOT Paula-faithful and is not claimed to be.
 //  - VisualizerChannel, ISnapshot, OnModuleInfoChanged, position-visit tracking
 //    are intentionally dropped. End detection falls back to a position counter
 //    that resets to song.Restart on wrap.

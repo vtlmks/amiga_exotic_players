@@ -1,124 +1,252 @@
 // Copyright (c) 2026 Peter Fors
 // SPDX-License-Identifier: MIT
 //
-// Minimal Amiga Paula emulator for custom replayers.
-// Reads 8-bit signed samples; writes interleaved float stereo frames.
-// Hard-panned LRRL (Amiga native). All functions static.
+// Amiga 500 Paula emulator for custom replayers.
 //
-// Output is ACCUMULATED into the caller's float buffer, nominally [-1.0, 1.0].
-// One channel at full volume (vol=64), hard pan, peak sample produces |1.0|.
-// No saturation is performed; the host is responsible for any final clipping.
+// This is a hardware model, not a resampler. The channel mixer runs in the
+// Paula clock domain (3546895 Hz PAL / 3579545 Hz NTSC). Each hardware
+// channel has a period counter that, when it expires, latches the next 8-bit
+// sample byte; between latches the channel holds that byte (the zero-order-
+// hold staircase a real Paula produces). Volume is the real 6-bit PWM over a
+// 64-clock window, not a multiply, so its quantization noise is reproduced.
+// Channels 0+3 are summed to the left output, 1+2 to the right, hard-panned,
+// in the Paula clock domain. The A500 analog filter chain (fixed ~4.4 kHz RC
+// low-pass plus the switchable ~3.3 kHz LED Butterworth) runs at the Paula
+// clock rate. Only the final stage decimates to the host rate, by box-filter
+// integration of the Paula-clock samples that fall in each output window.
+// Aliasing and quantization noise that a real A500 produces are preserved.
+//
+// Channels 0..3 are the hardware Paula path. Channels 4.. are a software-
+// mixer extension used by formats that fake extra voices (Hippel 7, OctaMed
+// 8, DBM up to 32). Those run in the same Paula clock domain with the same
+// zero-order-hold, but use linear volume and their pan field, and are summed
+// in after the analog filters (they are not hardware, so the A500 filter
+// chain does not apply to them).
+//
+// Output is ACCUMULATED into the caller's float buffer. The hardware output
+// chain is modelled end to end, to the RCA jack, not just to the summer node:
+//
+//   1. Resistive averaging summer: the two channels on each side (0+3 left,
+//      1+2 right) join through equal board resistors, so the per-side node
+//      is (ch_a + ch_b) / 2 (a ~6 dB attenuation).
+//   2. The A500 analog filter chain (fixed ~4.4 kHz RC, switchable ~3.3 kHz
+//      LED Butterworth) acts on that node.
+//   3. Output buffer/amp: normalises int8 full scale to unity (no make-up
+//      gain over the resistive divider), then soft saturation into the
+//      supply rails. The divider is left uncompensated on purpose: it puts
+//      a single full-scale channel at ~0.5 (well clear of the 0.8 knee,
+//      fully linear) and two correlated full-scale channels on the same
+//      side at ~1.0 (just into the knee). So the saturator engages only on
+//      genuinely hot correlated multi-channel content -- as a real A500
+//      measurably does -- not on ordinary single/normal-level material.
+//      It is a soft knee, not a hard clip (which would synthesise harmonics
+//      the machine never produces) and not clip-free. Absolute level is the
+//      host's concern; this trades ~6 dB of headroom for a faithful
+//      saturation onset.
+//
+// The software-mixer extension (channels 4..) is NOT hardware: it is summed
+// into the post-amp output bus linearly (one such voice at full volume = 1.0),
+// its level is the driving replayer's responsibility, and the host remains
+// the last-resort saturation point only for that path.
 
 #pragma once
 
 #include <stdint.h>
 #include <string.h>
+#include <math.h>
 
-// PAULA_NUM_CHANNELS sets the number of virtual channels. Real Amiga has 4,
-// but several formats fake more via CPU mixing: 7-voice Hippel, 8-channel
-// OctaMed/Oktalyzer, up to 32 channels in DBM3. We expose all as virtual
-// channels and let the player drive them; the output mixer sums them all.
+// Opt-in mixer profiler. Compiled in only when PAULA_PROFILE is defined, so
+// normal builds carry zero footprint. Accumulates process CPU time spent
+// strictly inside paula_mix_frames (not replayer tick work) and the number of
+// frames produced; paula_profile_report() turns that into a realtime factor.
+#ifdef PAULA_PROFILE
+#include <stdio.h>
+#include <time.h>
+static double paula_profile_cpu_ns = 0.0;
+static uint64_t paula_profile_frames = 0;
+#endif
+
+// PAULA_NUM_CHANNELS sets the number of virtual channels. Real Paula has 4
+// (indices 0..3, the hardware path); the rest are the software-mixer
+// extension for formats that fake more voices via CPU mixing.
 #define PAULA_NUM_CHANNELS 32
 #define PAULA_PAL_CLOCK    3546895
-#define PAULA_FP_SHIFT     14
-#define PAULA_FP_ONE       (1u << PAULA_FP_SHIFT)
-// Real Amiga Paula register minimum; matches NostalgicPlayer Channel.SetAmigaPeriod.
-// Software-mixer-only paths that need higher rates should use paula_set_freq_hz.
-#define PAULA_MIN_PERIOD   113
+#define PAULA_NTSC_CLOCK   3579545
+// Real Paula audio DMA floor. The Hardware Reference Manual's period-124
+// figure is the rate at which all four channels can DMA without the bus
+// falling behind during display fetch; a single channel goes lower. The true
+// hardware floor is period 113 -- the ProTracker/Soundtracker note table
+// bottoms at exactly 113 (B-3) because that is where Paula stops. Clamping to
+// 124 detunes the whole top octave flat (period 113 -> ~160 cents). The
+// hardware channels (0..3) clamp to this; CPU-fed software channels (4..)
+// have no such floor.
+#define PAULA_DMA_MIN_PERIOD 113
+
+// Period accumulator fixed-point: one Paula clock advances the accumulator by
+// PAULA_PERIOD_ONE; a channel consumes one sample byte every period_q of
+// these. period_q is integer-exact for the Paula register path and fractional
+// for the Hz path, so both keep exact pitch.
+#define PAULA_PERIOD_SHIFT 16
+#define PAULA_PERIOD_ONE   (1ull << PAULA_PERIOD_SHIFT)
 
 struct paula_channel {
 	int8_t *sample;
-	uint32_t length_fp;        // length << FP_SHIFT
-	uint32_t loop_start_fp;
-	uint32_t loop_length_fp;   // 0 => no loop (one-shot)
-	uint32_t pos_fp;
-	uint32_t step_fp;
+	uint32_t length;           // bytes (becomes loop_start+loop_length after first wrap)
+	uint32_t loop_start;       // bytes
+	uint32_t loop_length;      // bytes, 0 => one-shot
+	uint32_t pos;              // current byte index into sample
+	uint64_t period_q;         // Paula clocks per sample byte, Q16
+	uint64_t period_acc;       // period accumulator, Q16
 	int8_t *pending_sample;    // deferred switch on next wrap (Paula AUDxLC trick)
-	uint32_t pending_length_fp;
-	uint32_t pending_pos_fp;
-	uint16_t period;
+	uint32_t pending_pos;
+	uint32_t pending_length;
+	int8_t cur;                // latched sample byte (zero-order-hold output)
 	uint16_t volume;           // 0..64 Amiga scale
+	uint8_t pwm_cnt;           // 0..63 volume-PWM phase (hardware channels)
 	uint8_t active;
 	uint8_t muted;
-	uint8_t pan;               // 0..127, 0=left 127=right
+	uint8_t pan;               // 0..127, 0=left 127=right (software channels)
 	uint8_t has_pending;
 	uint8_t backwards;         // 1 -> step DOWN through sample (DBP E3, etc.)
 };
 
+// Amiga model. Selects whether the fixed post-DAC RC low-pass is present. The
+// A500 has it (~4.4 kHz); the A1200's equivalent sits near ~34 kHz and is
+// effectively transparent, so it is not applied. The LED filter exists on
+// both. Default is the A500.
+#define PAULA_MODEL_A500   0
+#define PAULA_MODEL_A1200  1
+
 struct paula {
 	struct paula_channel ch[PAULA_NUM_CHANNELS];
-	int32_t sample_rate;
+	int32_t sample_rate;       // host output rate
+	int32_t clock;             // Paula clock (PAL/NTSC), internal mix rate
 	int32_t samples_per_tick;
 	int32_t tick_offset;
-	// Amiga LED low-pass filter (~3.3-5 kHz): a 1-pole IIR applied to the
-	// final stereo output. Off unless paula_set_lp_filter(p, 1) is called.
-	// Coefficient is computed in paula_init from sample_rate.
+	int32_t model;
+
+	// Box-filter decimation from the Paula clock domain to the host rate.
+	// Each output sample averages the decim_step (Q16) Paula clocks that
+	// fall in its window; decim_phase carries the fraction across calls so
+	// the clock count alternates with no pitch drift.
+	uint64_t decim_step;
+	uint64_t decim_phase;
+
+	// Fixed 1-pole RC low-pass (A500: ~4.4 kHz), at the Paula clock rate.
+	// Always on for the A500 model, bypassed for the A1200.
+	double fixed_lp_a;
+	double fixed_lp_l;
+	double fixed_lp_r;
+
+	// Switchable LED filter: 2-pole Butterworth low-pass (~3.3 kHz,
+	// Q=1/sqrt(2)), at the Paula clock rate, RBJ bilinear coefficients.
+	// Driven by the replayer via paula_set_lp_filter; biquad state (TDF-II,
+	// per stereo side) persists across toggles so flips don't click.
 	int32_t lp_filter_on;
-	float lp_alpha;                // smoothing coefficient
-	float lp_state_l;              // last-output sample (left)
-	float lp_state_r;
+	double led_b0;
+	double led_b1;
+	double led_b2;
+	double led_a1;
+	double led_a2;
+	double led_z1_l;
+	double led_z2_l;
+	double led_z1_r;
+	double led_z2_r;
 };
+
+// [=]===^=[ paula_recalc ]=======================================================================[=]
+// Recompute every rate-dependent coefficient from p->clock and
+// p->sample_rate. The analog filters run at the Paula clock, so their
+// coefficients are bilinear-transformed for that rate, not the host rate.
+static void paula_recalc(struct paula *p) {
+	double fs = (double)p->clock;
+	double dt = 1.0 / fs;
+
+	// Fixed RC low-pass (A500), ~4.4 kHz. a = dt / (RC + dt).
+	double lp_rc = 1.0 / (2.0 * 3.14159265358979323846 * 4400.0);
+	p->fixed_lp_a = dt / (lp_rc + dt);
+
+	// LED filter: 2-pole Butterworth low-pass, ~3.3 kHz, Q = 1/sqrt(2),
+	// RBJ cookbook low-pass mapped via the bilinear transform at fs.
+	double fc = 3300.0;
+	double q = 0.70710678118654752440;
+	double w0 = 2.0 * 3.14159265358979323846 * fc / fs;
+	double cw = cos(w0);
+	double sw = sin(w0);
+	double alpha = sw / (2.0 * q);
+	double a0 = 1.0 + alpha;
+	p->led_b0 = ((1.0 - cw) * 0.5) / a0;
+	p->led_b1 = (1.0 - cw) / a0;
+	p->led_b2 = ((1.0 - cw) * 0.5) / a0;
+	p->led_a1 = (-2.0 * cw) / a0;
+	p->led_a2 = (1.0 - alpha) / a0;
+
+	// Box-filter decimation step: Paula clocks per host output sample, Q16.
+	p->decim_step = ((uint64_t)p->clock << PAULA_PERIOD_SHIFT) / (uint64_t)p->sample_rate;
+}
 
 // [=]===^=[ paula_init ]=========================================================================[=]
 static void paula_init(struct paula *p, int32_t sample_rate, int32_t tick_rate_hz) {
 	memset(p, 0, sizeof(*p));
 	p->sample_rate = sample_rate;
+	p->clock = PAULA_PAL_CLOCK;
 	p->samples_per_tick = sample_rate / tick_rate_hz;
-	// LRRL repeating for any extra virtual channels (4..7 etc).
+	p->model = PAULA_MODEL_A500;
+	// 0+3 -> left, 1+2 -> right for the hardware channels; the software
+	// channels default to the same LRRL pattern until a player sets pan.
 	for(int32_t i = 0; i < PAULA_NUM_CHANNELS; ++i) {
 		p->ch[i].pan = ((i & 2) != 0) ^ ((i & 1) != 0) ? 127 : 0;
 	}
-	// Pre-compute the LED-filter coefficient for ~4 kHz cutoff:
-	// alpha = dt / (RC + dt), where dt = 1 / sample_rate, RC = 1 / (2 PI fc).
-	// At sr=48000, fc=4000: alpha ~= 0.343.
-	{
-		double fc = 4000.0;
-		double dt = 1.0 / (double)sample_rate;
-		double rc = 1.0 / (2.0 * 3.14159265358979 * fc);
-		double a = dt / (rc + dt);
-		if(a < 0.0) {
-			a = 0.0;
-		}
-		if(a > 1.0) {
-			a = 1.0;
-		}
-		p->lp_alpha = (float)a;
-	}
+	paula_recalc(p);
+}
+
+// [=]===^=[ paula_set_clock ]====================================================================[=]
+// Select the Paula clock (PAULA_PAL_CLOCK / PAULA_NTSC_CLOCK). Recomputes the
+// rate-dependent coefficients. Default after paula_init is PAL.
+static void paula_set_clock(struct paula *p, int32_t clock_hz) {
+	p->clock = clock_hz > 0 ? clock_hz : PAULA_PAL_CLOCK;
+	paula_recalc(p);
+}
+
+// [=]===^=[ paula_set_model ]====================================================================[=]
+// Select the emulated machine. Only the fixed post-DAC low-pass differs: the
+// A500 applies it (~4.4 kHz), the A1200 does not. Default is the A500.
+static void paula_set_model(struct paula *p, int32_t model) {
+	p->model = (model == PAULA_MODEL_A1200) ? PAULA_MODEL_A1200 : PAULA_MODEL_A500;
 }
 
 // [=]===^=[ paula_set_lp_filter ]================================================================[=]
-// Enable or disable the Amiga LED filter. The filter is a 1-pole low-pass
-// (~4 kHz cutoff) applied to the final stereo output. State persists across
-// toggle calls so brief flips don't reset the smoothing.
+// Enable or disable the switchable Amiga LED filter (the power-LED-gated
+// 2-pole low-pass). Replayers call this to mirror the module's own filter
+// state. The fixed RC low-pass is not affected and always runs (A500).
 static void paula_set_lp_filter(struct paula *p, int32_t on) {
 	p->lp_filter_on = on ? 1 : 0;
 }
 
 // [=]===^=[ paula_set_period ]===================================================================[=]
+// Amiga AUDxPER (DMA) period. The hardware channels (0..3) clamp to the real
+// Paula DMA minimum of 124; software channels (4..) have no such floor.
 static void paula_set_period(struct paula *p, int32_t idx, uint16_t period) {
-	struct paula_channel *c = &p->ch[idx];
-	if(period < PAULA_MIN_PERIOD) {
-		period = PAULA_MIN_PERIOD;
+	if(idx < 4 && period != 0 && period < PAULA_DMA_MIN_PERIOD) {
+		period = PAULA_DMA_MIN_PERIOD;
 	}
-	c->period = period;
-	uint64_t freq_fp = ((uint64_t)PAULA_PAL_CLOCK << PAULA_FP_SHIFT) / period;
-	c->step_fp = (uint32_t)(freq_fp / (uint32_t)p->sample_rate);
+	if(period == 0) {
+		p->ch[idx].period_q = 0;
+		return;
+	}
+	p->ch[idx].period_q = (uint64_t)period << PAULA_PERIOD_SHIFT;
 }
 
 // [=]===^=[ paula_set_freq_hz ]==================================================================[=]
-// Set channel playback rate directly in Hz, bypassing the Amiga-Paula period
-// model. Useful for replayers (DigiBoosterPro, FaceTheMusic, etc.) that drive
-// the mixer at frequencies above Paula's hardware MIN_PERIOD limit -- a
-// software mixer has no such cap. paula_set_period clamps at MIN_PERIOD,
-// which silently drops sample-rate to ~28.6 kHz; this routine does not.
+// Set channel playback rate directly in Hz (CPU-fed software path, e.g.
+// DigiBoosterPro/FaceTheMusic). No DMA period floor; the period is fractional
+// in the Paula clock domain so pitch stays exact.
 static void paula_set_freq_hz(struct paula *p, int32_t idx, uint32_t freq_hz) {
-	struct paula_channel *c = &p->ch[idx];
-	if(freq_hz == 0 || p->sample_rate <= 0) {
-		c->step_fp = 0;
+	if(freq_hz == 0) {
+		p->ch[idx].period_q = 0;
 		return;
 	}
-	c->period = 0;
-	c->step_fp = (uint32_t)(((uint64_t)freq_hz << PAULA_FP_SHIFT) / (uint32_t)p->sample_rate);
+	p->ch[idx].period_q = ((uint64_t)p->clock << PAULA_PERIOD_SHIFT) / (uint64_t)freq_hz;
 }
 
 // [=]===^=[ paula_set_volume ]===================================================================[=]
@@ -143,76 +271,72 @@ static void paula_set_volume_256(struct paula *p, int32_t idx, uint16_t volume) 
 static void paula_play_sample(struct paula *p, int32_t idx, int8_t *sample, uint32_t length) {
 	struct paula_channel *c = &p->ch[idx];
 	c->sample = sample;
-	c->length_fp = length << PAULA_FP_SHIFT;
-	// Backwards-mode initial position is one fractional step below the end so
-	// the first read fetches the last sample. Forward-mode starts at 0.
-	c->pos_fp = c->backwards
-	    ? ((length > 0) ? (uint32_t)((length << PAULA_FP_SHIFT) - 1) : 0)
-	    : 0;
-	c->loop_start_fp = 0;
-	c->loop_length_fp = 0;
+	c->length = length;
+	c->pos = (c->backwards && length > 0) ? (length - 1) : 0;
+	c->loop_start = 0;
+	c->loop_length = 0;
 	c->has_pending = 0;
 	c->pending_sample = 0;
+	c->period_acc = 0;
 	c->active = (sample != 0) && (length > 0);
+	c->cur = c->active ? sample[c->pos] : 0;
 }
 
 // [=]===^=[ paula_set_backwards ]================================================================[=]
 // Set or clear the backwards-playback flag for a channel. Takes effect on the
-// next paula_play_sample call (which seeds pos_fp at the high end of the
-// sample) and changes the per-step direction in paula_mix_frames.
+// next paula_play_sample (which seeds pos at the high end) and reverses the
+// per-byte advance direction.
 static void paula_set_backwards(struct paula *p, int32_t idx, int32_t on) {
 	p->ch[idx].backwards = on ? 1 : 0;
 }
 
 // [=]===^=[ paula_set_pos ]======================================================================[=]
-// Move the channel's read position to `byte_offset` within the current sample.
-// Used by tracker effects like ProTracker 9xx (sample offset) that retrigger
-// playback at a non-zero starting offset. Clamps to [0, length-1] so a bad
-// offset can't drive the mixer past end-of-sample.
+// Move the channel's read position to `byte_offset` within the current sample
+// and re-latch the held byte. Used by effects like ProTracker 9xx (sample
+// offset). Clamps to [0, length-1].
 static void paula_set_pos(struct paula *p, int32_t idx, uint32_t byte_offset) {
 	struct paula_channel *c = &p->ch[idx];
-	uint32_t len_bytes = c->length_fp >> PAULA_FP_SHIFT;
-	if(len_bytes == 0) {
-		c->pos_fp = 0;
+	if(c->sample == 0 || c->length == 0) {
+		c->pos = 0;
+		c->cur = 0;
 		return;
 	}
-	if(byte_offset >= len_bytes) {
-		byte_offset = len_bytes - 1;
+	if(byte_offset >= c->length) {
+		byte_offset = c->length - 1;
 	}
-	c->pos_fp = byte_offset << PAULA_FP_SHIFT;
+	c->pos = byte_offset;
+	c->cur = c->sample[byte_offset];
 }
 
 // [=]===^=[ paula_queue_sample ]=================================================================[=]
-// If the channel is currently active (playing), the new sample takes effect
-// when the current one reaches length (Amiga "write AUDxLC/AUDxLEN mid-DMA").
-// If the channel is inactive (DMA off), the new sample starts immediately
-// (matches NostalgicPlayer's mixer semantics: SetSample on an inactive
-// channel triggers playback right away).
-//
-// Plays from sample[start_offset] for `length` samples, then wraps using the
-// channel's current loop_start / loop_length (set via paula_set_loop).
+// If the channel is active, the new sample takes effect when the current one
+// reaches length (Amiga "write AUDxLC/AUDxLEN mid-DMA"). If inactive, it
+// starts immediately. Plays from sample[start_offset] for `length` bytes,
+// then wraps using the channel's current loop_start / loop_length.
 static void paula_queue_sample(struct paula *p, int32_t idx, int8_t *sample, uint32_t start_offset, uint32_t length) {
 	struct paula_channel *c = &p->ch[idx];
 	if(!c->active && sample != 0 && length > 0) {
 		c->sample = sample;
-		c->pos_fp = start_offset << PAULA_FP_SHIFT;
-		c->length_fp = (start_offset + length) << PAULA_FP_SHIFT;
+		c->pos = start_offset;
+		c->length = start_offset + length;
 		c->has_pending = 0;
 		c->pending_sample = 0;
+		c->period_acc = 0;
 		c->active = 1;
+		c->cur = sample[start_offset];
 		return;
 	}
 	c->pending_sample = sample;
-	c->pending_pos_fp = start_offset << PAULA_FP_SHIFT;
-	c->pending_length_fp = (start_offset + length) << PAULA_FP_SHIFT;
+	c->pending_pos = start_offset;
+	c->pending_length = start_offset + length;
 	c->has_pending = (sample != 0) && (length > 0);
 }
 
 // [=]===^=[ paula_set_loop ]=====================================================================[=]
 static void paula_set_loop(struct paula *p, int32_t idx, uint32_t start, uint32_t length) {
 	struct paula_channel *c = &p->ch[idx];
-	c->loop_start_fp = start << PAULA_FP_SHIFT;
-	c->loop_length_fp = length << PAULA_FP_SHIFT;
+	c->loop_start = start;
+	c->loop_length = length;
 }
 
 // [=]===^=[ paula_mute ]=========================================================================[=]
@@ -220,97 +344,250 @@ static void paula_mute(struct paula *p, int32_t idx) {
 	p->ch[idx].active = 0;
 }
 
+// [=]===^=[ paula_ch_advance ]===================================================================[=]
+// Consume one sample byte for a channel: step the read position one byte
+// (forward or backward), apply the pending-sample swap / loop wrap / one-shot
+// stop exactly as Paula DMA does, and re-latch the held byte.
+static void paula_ch_advance(struct paula_channel *c) {
+	if(!c->backwards) {
+		uint32_t np = c->pos + 1;
+		if(np >= c->length) {
+			if(c->has_pending) {
+				c->sample = c->pending_sample;
+				np = c->pending_pos;
+				c->length = c->pending_length;
+				c->has_pending = 0;
+				c->pending_sample = 0;
+			} else if(c->loop_length > 0) {
+				uint32_t over = np - c->length;
+				np = c->loop_start + (over % c->loop_length);
+				c->length = c->loop_start + c->loop_length;
+			} else {
+				c->active = 0;
+				return;
+			}
+		}
+		c->pos = np;
+	} else {
+		if(c->pos == 0 || (c->loop_length > 0 && c->pos <= c->loop_start)) {
+			if(c->loop_length > 0) {
+				c->pos = c->loop_start + c->loop_length - 1;
+			} else {
+				c->active = 0;
+				return;
+			}
+		} else {
+			c->pos = c->pos - 1;
+		}
+	}
+	c->cur = c->sample[c->pos];
+}
+
+// [=]===^=[ paula_softclip ]=====================================================================[=]
+// Soft saturation of the A500 output buffer/amp into its supply rails. Unity
+// (identity) for |x| <= t so single-channel and typical multi-channel levels
+// are unaffected; above t it bends smoothly (C1-continuous, slope 1 at the
+// knee) and asymptotes to +/-1. Aggressive correlated multi-channel content
+// is compressed into the rails the way a real A500 does -- not a hard clip,
+// which would synthesise harmonics the machine never produces.
+static double paula_softclip(double x) {
+	double t = 0.8;
+	double a = (x < 0.0) ? -x : x;
+	if(a <= t) {
+		return x;
+	}
+	double s = (x < 0.0) ? -1.0 : 1.0;
+	return s * (t + (1.0 - t) * tanh((a - t) / (1.0 - t)));
+}
+
 // [=]===^=[ paula_mix_frames ]===================================================================[=]
-// Accumulates `frames` float stereo frames into `output`. Caller must pre-clear.
-// One channel at full volume (vol=64), hard pan, peak sample (|s|=128) -> |1.0|.
-// No clipping is applied; the host saturates at the final output stage.
+// Accumulates `frames` float stereo frames into `output`. Caller must
+// pre-clear. The inner loop runs at the Paula clock; each output frame is the
+// box-filter average of the Paula-clock samples in its window.
 static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
-	// Combined scaling: sample/128 (int8 -> [-1,1]) * volume/64 * pan/127.
-	const float vol_scale = 1.0f / (128.0f * 64.0f * 127.0f);
+#ifdef PAULA_PROFILE
+	struct timespec prof_t0;
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &prof_t0);
+#endif
+	int32_t fixed = (p->model == PAULA_MODEL_A500);
+	int32_t led = p->lp_filter_on;
+	double fa = p->fixed_lp_a;
+	double fll = p->fixed_lp_l;
+	double flr = p->fixed_lp_r;
+	double lb0 = p->led_b0;
+	double lb1 = p->led_b1;
+	double lb2 = p->led_b2;
+	double la1 = p->led_a1;
+	double la2 = p->led_a2;
+	double lz1l = p->led_z1_l;
+	double lz2l = p->led_z2_l;
+	double lz1r = p->led_z1_r;
+	double lz2r = p->led_z2_r;
+	uint64_t phase = p->decim_phase;
+	uint64_t dstep = p->decim_step;
+	// amp_gain normalises int8 full scale (128) to 1.0 and deliberately does
+	// NOT make up the resistive divider's 6 dB: a single full-scale channel
+	// lands at ~0.5 (linear, clear of the 0.8 soft knee) and two correlated
+	// full-scale channels on a side at ~1.0 (just into the knee), so the
+	// saturator only engages on genuinely hot correlated content the way a
+	// real A500 does -- not on ordinary single/normal-level material.
+	// lin_scale puts one software (channel >=4) voice at full volume at 1.0
+	// in the same normalized domain. Output is the box-filter average over
+	// the window (/n).
+	const double amp_gain = 1.0 / 128.0;
+	const double lin_scale = 1.0 / (64.0 * 127.0 * 128.0);
+
+	// Active-channel working set, built once per call. The selection
+	// predicate (active / unmuted / has sample / nonzero period) is stable
+	// within a mix call: only `active` can drop, when a one-shot sample ends
+	// mid-call, which the inner loop already detects per channel. Hardware
+	// (0..3) and software (4..) channels go in separate ascending lists so
+	// the per-clock loop carries no hardware/software path branch and the
+	// software path vanishes entirely for formats that never use it.
+	// Ascending order matches the original 0..31 index sweep, so each mix
+	// accumulator sees the same addition order and the output is bit-identical.
+	uint32_t hw[4];
+	uint32_t sw[PAULA_NUM_CHANNELS - 4];
+	uint32_t nhw = 0;
+	uint32_t nsw = 0;
 	for(int32_t ci = 0; ci < PAULA_NUM_CHANNELS; ++ci) {
 		struct paula_channel *c = &p->ch[ci];
-		if(!c->active || c->muted || c->sample == 0 || c->step_fp == 0) {
+		if(!c->active || c->muted || c->sample == 0 || c->period_q == 0) {
 			continue;
 		}
-		float lvol = (float)c->volume * (float)(127 - c->pan) * vol_scale;
-		float rvol = (float)c->volume * (float)c->pan         * vol_scale;
-		uint32_t step = c->step_fp;
-		uint32_t length = c->length_fp;
-		uint32_t loop_start = c->loop_start_fp;
-		uint32_t loop_length = c->loop_length_fp;
-		int8_t *sdat = c->sample;
-		float *out = output;
-		if(!c->backwards) {
-			uint32_t pos = c->pos_fp;
-			for(int32_t i = 0; i < frames; ++i) {
-				if(pos >= length) {
-					if(c->has_pending) {
-						sdat = c->pending_sample;
-						pos = c->pending_pos_fp;
-						length = c->pending_length_fp;
-						c->sample = sdat;
-						c->length_fp = length;
-						c->has_pending = 0;
-						c->pending_sample = 0;
-					} else if(loop_length > 0) {
-						uint32_t over = pos - length;
-						pos = loop_start + (over % loop_length);
-						length = loop_start + loop_length;
-						c->length_fp = length;
-					} else {
-						c->active = 0;
-						break;
-					}
-				}
-				float s = (float)sdat[pos >> PAULA_FP_SHIFT];
-				out[0] += s * lvol;
-				out[1] += s * rvol;
-				out += 2;
-				pos += step;
-			}
-			c->pos_fp = pos;
+		if(ci < 4) {
+			hw[nhw++] = (uint32_t)ci;
 		} else {
-			// Backwards path: pos counted in int64_t so underflow is plain
-			// arithmetic. Wrap on pos < loop_start (or < 0 if no loop).
-			int64_t pos = (int64_t)c->pos_fp;
-			int64_t lo = (int64_t)loop_start;
-			int64_t llen = (int64_t)loop_length;
-			for(int32_t i = 0; i < frames; ++i) {
-				if((llen > 0 && pos < lo) || (llen == 0 && pos < 0)) {
-					if(llen > 0) {
-						int64_t hi = lo + llen;
-						int64_t under = lo - pos;
-						pos = hi - 1 - (under % llen);
-					} else {
-						c->active = 0;
-						break;
-					}
-				}
-				float s = (float)sdat[(uint32_t)pos >> PAULA_FP_SHIFT];
-				out[0] += s * lvol;
-				out[1] += s * rvol;
-				out += 2;
-				pos -= (int64_t)step;
-			}
-			c->pos_fp = (uint32_t)((pos < 0) ? 0 : pos);
+			sw[nsw++] = (uint32_t)ci;
 		}
 	}
 
-	// Amiga LED filter: 1-pole IIR over the final stereo output.
-	// y[n] = y[n-1] + alpha * (x[n] - y[n-1]).
-	if(p->lp_filter_on) {
-		float a = p->lp_alpha;
-		float yl = p->lp_state_l;
-		float yr = p->lp_state_r;
-		float *out = output;
-		for(int32_t i = 0; i < frames; ++i) {
-			yl += (out[0] - yl) * a;
-			yr += (out[1] - yr) * a;
-			out[0] = yl;
-			out[1] = yr;
-			out += 2;
+	for(int32_t i = 0; i < frames; ++i) {
+		phase += dstep;
+		uint32_t n = (uint32_t)(phase >> PAULA_PERIOD_SHIFT);
+		phase &= (PAULA_PERIOD_ONE - 1);
+		if(n == 0) {
+			n = 1;
 		}
-		p->lp_state_l = yl;
-		p->lp_state_r = yr;
+		double sl = 0.0;
+		double sr = 0.0;
+		for(uint32_t k = 0; k < n; ++k) {
+			double pl = 0.0;
+			double pr = 0.0;
+			double ll = 0.0;
+			double rl = 0.0;
+			for(uint32_t j = 0; j < nhw; ++j) {
+				uint32_t ci = hw[j];
+				struct paula_channel *c = &p->ch[ci];
+				if(!c->active) {
+					continue;
+				}
+				c->period_acc += PAULA_PERIOD_ONE;
+				while(c->period_acc >= c->period_q) {
+					c->period_acc -= c->period_q;
+					paula_ch_advance(c);
+					if(!c->active) {
+						break;
+					}
+				}
+				if(!c->active) {
+					continue;
+				}
+				c->pwm_cnt = (uint8_t)((c->pwm_cnt + 1) & 63);
+				int32_t s = (c->pwm_cnt < c->volume) ? (int32_t)c->cur : 0;
+				if(ci == 0 || ci == 3) {
+					pl += (double)s;
+				} else {
+					pr += (double)s;
+				}
+			}
+			for(uint32_t j = 0; j < nsw; ++j) {
+				struct paula_channel *c = &p->ch[sw[j]];
+				if(!c->active) {
+					continue;
+				}
+				c->period_acc += PAULA_PERIOD_ONE;
+				while(c->period_acc >= c->period_q) {
+					c->period_acc -= c->period_q;
+					paula_ch_advance(c);
+					if(!c->active) {
+						break;
+					}
+				}
+				if(!c->active) {
+					continue;
+				}
+				int32_t v = (int32_t)c->cur * (int32_t)c->volume;
+				ll += (double)(v * (int32_t)(127 - c->pan));
+				rl += (double)(v * (int32_t)c->pan);
+			}
+			// Passive resistive averaging summer: the per-side filter
+			// node is (ch_a + ch_b) / 2, so it cannot exceed a single
+			// channel's full scale and the hardware path never clips.
+			double xl = pl * 0.5;
+			double xr = pr * 0.5;
+			if(fixed) {
+				fll += (xl - fll) * fa;
+				flr += (xr - flr) * fa;
+				xl = fll;
+				xr = flr;
+			}
+			if(led) {
+				double yl = lb0 * xl + lz1l;
+				lz1l = lb1 * xl - la1 * yl + lz2l;
+				lz2l = lb2 * xl - la2 * yl;
+				double yr = lb0 * xr + lz1r;
+				lz1r = lb1 * xr - la1 * yr + lz2r;
+				lz2r = lb2 * xr - la2 * yr;
+				xl = yl;
+				xr = yr;
+			}
+			// Downstream output buffer/amp: gain compensation then soft
+			// saturation into the rails (the analog stage sees only the
+			// hardware channels).
+			xl = paula_softclip(xl * amp_gain);
+			xr = paula_softclip(xr * amp_gain);
+			// Software-mixer extension (channels 4..): not hardware, so it
+			// is summed into the post-amp output bus, not through the amp.
+			xl += ll * lin_scale;
+			xr += rl * lin_scale;
+			sl += xl;
+			sr += xr;
+		}
+		double inv = 1.0 / (double)n;
+		output[2 * i]     += (float)(sl * inv);
+		output[2 * i + 1] += (float)(sr * inv);
 	}
+
+	p->fixed_lp_l = fll;
+	p->fixed_lp_r = flr;
+	p->led_z1_l = lz1l;
+	p->led_z2_l = lz2l;
+	p->led_z1_r = lz1r;
+	p->led_z2_r = lz2r;
+	p->decim_phase = phase;
+
+#ifdef PAULA_PROFILE
+	struct timespec prof_t1;
+	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &prof_t1);
+	paula_profile_cpu_ns += (double)(prof_t1.tv_sec - prof_t0.tv_sec) * 1.0e9 + (double)(prof_t1.tv_nsec - prof_t0.tv_nsec);
+	paula_profile_frames += (uint64_t)frames;
+#endif
 }
+
+#ifdef PAULA_PROFILE
+// [=]===^=[ paula_profile_report ]===============================================================[=]
+// Print the accumulated mixer cost as a realtime factor. Call once at exit.
+static void paula_profile_report(int32_t sample_rate) {
+	if(paula_profile_frames == 0) {
+		fprintf(stderr, "paula_mix_frames: never called (this player has its own mixer, not paula.h)\n");
+		return;
+	}
+	double cpu_s = paula_profile_cpu_ns * 1.0e-9;
+	double audio_s = (sample_rate > 0) ? (double)paula_profile_frames / (double)sample_rate : 0.0;
+	double rt = (cpu_s > 0.0) ? audio_s / cpu_s : 0.0;
+	double core_pct = (audio_s > 0.0) ? 100.0 * cpu_s / audio_s : 0.0;
+	fprintf(stderr, "paula_mix_frames: %.3fs CPU for %.1fs audio -> %.1fx realtime (%.2f%% of one core)\n",
+		cpu_s, audio_s, rt, core_pct);
+}
+#endif

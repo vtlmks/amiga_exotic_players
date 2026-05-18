@@ -597,9 +597,9 @@ static void sidmon20_cleanup(struct sidmon20_state *s) {
 static void sidmon20_paula_set_loop_data(struct paula *p, int32_t idx, int8_t *sample, uint32_t loop_start, uint32_t loop_length) {
 	struct paula_channel *c = &p->ch[idx];
 	c->sample = sample;
-	c->loop_start_fp = loop_start << PAULA_FP_SHIFT;
-	c->loop_length_fp = loop_length << PAULA_FP_SHIFT;
-	c->length_fp = (loop_start + loop_length) << PAULA_FP_SHIFT;
+	c->loop_start = loop_start;
+	c->loop_length = loop_length;
+	c->length = loop_start + loop_length;
 	if(loop_length > 0) {
 		c->active = 1;
 	}

@@ -461,7 +461,7 @@ static void tfmx_paula_apply_dma(struct tfmx_state *s, struct tfmx_voice_state *
 	int8_t *sample_ptr = (int8_t *)s->input.buf;
 	if(v->paula_dma_on) {
 		paula_play_sample(&s->paula, (int32_t)v->voice_num, sample_ptr, v->paula_start_offset + length_bytes);
-		s->paula.ch[v->voice_num].pos_fp = (uint64_t)v->paula_start_offset << PAULA_FP_SHIFT;
+		paula_set_pos(&s->paula, (int32_t)v->voice_num, v->paula_start_offset);
 		paula_set_loop(&s->paula, (int32_t)v->voice_num, v->paula_start_offset, length_bytes);
 		paula_set_period(&s->paula, (int32_t)v->voice_num, v->paula_period == 0 ? 0x100 : v->paula_period);
 		paula_set_volume(&s->paula, (int32_t)v->voice_num, v->paula_volume > 64 ? 64 : v->paula_volume);

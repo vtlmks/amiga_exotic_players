@@ -958,6 +958,7 @@ static void fc_effect(struct futurecomposer_state *s, int32_t chan) {
 			}
 
 			uint8_t dat;
+			int32_t do_transpose = 1;
 			switch(cmd) {
 				case 0xe2: {
 					if(seq_poi >= s->freq_sequences_len) {
@@ -974,16 +975,16 @@ static void fc_effect(struct futurecomposer_state *s, int32_t chan) {
 					break;
 				}
 				case 0xe4: {
+					if(seq_poi >= s->freq_sequences_len) {
+						break;
+					}
+					dat = s->freq_sequences[seq_poi++];
 					if(v->audio_on) {
-						if(seq_poi >= s->freq_sequences_len) {
-							break;
-						}
-						dat = s->freq_sequences[seq_poi++];
 						if(dat < FC_TOTAL_SLOTS) {
 							fc_apply_loop_switch(s, chan, dat);
 						}
-						v->frequency_seq_pos += 2;
 					}
+					v->frequency_seq_pos += 2;
 					break;
 				}
 				case 0xe9: {
@@ -1005,7 +1006,7 @@ static void fc_effect(struct futurecomposer_state *s, int32_t chan) {
 						break;
 					}
 					dat = s->freq_sequences[seq_poi];
-					uint32_t new_poi = sizeof(fc_silent) + (uint32_t)dat * 64;
+					uint32_t new_poi = sizeof(fc_silent) + (uint32_t)(dat & 0x3fu) * 64;
 					if(new_poi >= s->freq_sequences_len) {
 						new_poi = 0;
 					}
@@ -1039,12 +1040,13 @@ static void fc_effect(struct futurecomposer_state *s, int32_t chan) {
 					v->vib_speed = (int8_t)s->freq_sequences[seq_poi++];
 					v->vib_depth = (int8_t)s->freq_sequences[seq_poi++];
 					v->frequency_seq_pos += 3;
+					do_transpose = 0;
 					break;
 				}
 				default: break;
 			}
 
-			if(!parse_effect && !one_more) {
+			if(!parse_effect && !one_more && do_transpose) {
 				uint32_t trans_poi = (uint32_t)v->frequency_seq_start_offset + (uint32_t)v->frequency_seq_pos;
 				if(trans_poi < s->freq_sequences_len) {
 					v->patt_transpose = (int8_t)s->freq_sequences[trans_poi];

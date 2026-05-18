@@ -31,12 +31,15 @@
 //   ...        sample data follows pattern data (signed 8-bit PCM)
 //
 // Variant selection:
-//   The host picks the effect-command interpretation at compile time via the
-//   SOUNDTRACKER_VARIANT macro. Default is SOUNDTRACKER_VARIANT_UST. Other
-//   variant constants are reserved; they fall through to UST behavior until
-//   their effect tables are added.
+//   UST and the D.O.C. Soundtracker II+ family share an identical on-disk
+//   layout; they differ only in the effect-command table for opcodes 0/1/2.
+//   The variant is detected from pattern content at load time (see
+//   st_detect_variant): UST emits only effects 0/1/2, so any cell using an
+//   opcode in 3..F is conclusive evidence of the post-UST family. A host that
+//   knows better may force the choice by defining SOUNDTRACKER_VARIANT before
+//   including this header.
 //
-// Effect commands (UST):
+// Effect commands (UST -- Karsten Obarski, 1987):
 //   0xy : no effect
 //   1xy : arpeggio (cycle through row note, +x semitones, +y semitones in
 //         the chromatic period table). This is THE reason ProTracker
@@ -45,6 +48,12 @@
 //   2xy : pitch slide. If high nibble x is non-zero, period -= x per
 //         non-first tick (slide up). Else period += y per non-first tick
 //         (slide down). One direction per row.
+//
+// Effect commands (Soundtracker II / III / IV, MasterSoundtracker,
+// NoiseTracker -- the ProTracker-compatible family):
+//   0xy : arpeggio (cycle row note, +x, +y semitones); 000 = no effect
+//   1xx : portamento up   -- period -= xx per non-first tick
+//   2xx : portamento down -- period += xx per non-first tick
 //
 // Public API:
 //   struct soundtracker_state *soundtracker_init(void *data, uint32_t len, int32_t sample_rate);
@@ -67,9 +76,9 @@ enum {
 	SOUNDTRACKER_VARIANT_NOISE   = 4,  // reserved -- NoiseTracker
 };
 
-#ifndef SOUNDTRACKER_VARIANT
-#define SOUNDTRACKER_VARIANT SOUNDTRACKER_VARIANT_UST
-#endif
+// SOUNDTRACKER_VARIANT, when defined by the host before including this
+// header, forces the effect-table interpretation. When left undefined the
+// variant is detected from pattern content (st_detect_variant).
 
 #define ST_VOICES         4
 #define ST_NUM_SAMPLES    15
@@ -128,6 +137,7 @@ struct soundtracker_state {
 	uint8_t  song_length;
 	uint8_t  pattern_table[ST_PAT_TABLE_LEN];
 	uint32_t num_patterns;
+	uint8_t  variant;               // SOUNDTRACKER_VARIANT_* (detected or host-forced)
 
 	struct st_voice voices[ST_VOICES];
 
@@ -343,6 +353,26 @@ static int32_t st_load(struct soundtracker_state *s) {
 	return 1;
 }
 
+// [=]===^=[ st_detect_variant ]==================================================================[=]
+// Ultimate Soundtracker (Obarski) only ever emits effect opcodes 0, 1 and 2.
+// The D.O.C. Soundtracker II+/Master/NoiseTracker family added the
+// ProTracker-compatible opcodes 3..F (set volume, pattern break, set speed,
+// ...). So a single cell using any opcode >= 3 is conclusive evidence of the
+// post-UST family; absent that, the module is treated as UST. This is the
+// same distinction uade draws (it just reaches it via the modland path
+// prefix); content is the only signal available to a standalone replayer.
+static uint8_t st_detect_variant(struct soundtracker_state *s) {
+	for(uint32_t p = 0; p < s->num_patterns; ++p) {
+		uint32_t base = ST_PAT_DATA_OFF + p * ST_PAT_BYTES;
+		for(uint32_t off = 2; off < ST_PAT_BYTES; off += 4) {
+			if((s->module_data[base + off] & 0x0f) >= 3) {
+				return SOUNDTRACKER_VARIANT_DOCST2;
+			}
+		}
+	}
+	return SOUNDTRACKER_VARIANT_UST;
+}
+
 // [=]===^=[ st_resolve_period_index ]============================================================[=]
 // Locate `period` in the 36-entry chromatic table. Periods stored in the
 // pattern can be exact table values (typical) or sample-finetuned variants;
@@ -474,6 +504,23 @@ static void st_apply_pitchbend(struct soundtracker_state *s, int32_t voice, stru
 	paula_set_period(&s->paula, voice, v->cur_period);
 }
 
+// [=]===^=[ st_apply_slide ]=====================================================================[=]
+// Soundtracker II family effects 1 (portamento up, delta < 0) and 2
+// (portamento down, delta > 0): a flat per-tick period change, clamped to the
+// Paula-playable range. Unlike UST effect 2 there is no nibble split -- the
+// whole argument byte is the slide rate.
+static void st_apply_slide(struct soundtracker_state *s, int32_t voice, struct st_voice *v, int32_t delta) {
+	int32_t p = (int32_t)v->cur_period + delta;
+	if(p < ST_PERIOD_MIN) {
+		p = ST_PERIOD_MIN;
+	}
+	if(p > ST_PERIOD_MAX) {
+		p = ST_PERIOD_MAX;
+	}
+	v->cur_period = (uint16_t)p;
+	paula_set_period(&s->paula, voice, v->cur_period);
+}
+
 // [=]===^=[ st_per_tick_effect ]=================================================================[=]
 // Effect dispatch. Runs on every tick including tick 0; per-effect handlers
 // decide whether tick 0 is meaningful (arpeggio: yes, resets to base period
@@ -481,26 +528,47 @@ static void st_apply_pitchbend(struct soundtracker_state *s, int32_t voice, stru
 // before the slide starts).
 //
 // Variant-sensitive effects (0/1/2 differ between UST and post-UST variants)
-// are guarded by SOUNDTRACKER_VARIANT. Effects that ProTracker/NoiseTracker
-// numbered 0xC/0xD/0xF (set volume, pattern break, set speed) use opcodes
-// UST never assigns, so they are dispatched unconditionally -- adding them
-// is harmless for pure UST mods and lets post-UST 15-sample mods (D.O.C.
-// SoundTracker, MasterSoundtracker, NoiseTracker, etc.) play correctly.
+// branch on s->variant. Effects that ProTracker/NoiseTracker numbered
+// 0xC/0xD/0xF (set volume, pattern break, set speed) use opcodes UST never
+// assigns, so they are dispatched unconditionally -- harmless for pure UST
+// mods and required for post-UST 15-sample mods (D.O.C. SoundTracker,
+// MasterSoundtracker, NoiseTracker, etc.) to play correctly.
 static void st_per_tick_effect(struct soundtracker_state *s, int32_t voice, struct st_voice *v, uint32_t tick) {
-#if SOUNDTRACKER_VARIANT == SOUNDTRACKER_VARIANT_UST
-	switch(v->effect) {
-		case 1:
-			st_apply_arpeggio(s, voice, v, tick);
-			break;
-		case 2:
-			if(tick != 0) {
-				st_apply_pitchbend(s, voice, v);
-			}
-			break;
-		default:
-			break;
+	if(s->variant == SOUNDTRACKER_VARIANT_UST) {
+		switch(v->effect) {
+			case 1:
+				st_apply_arpeggio(s, voice, v, tick);
+				break;
+			case 2:
+				if(tick != 0) {
+					st_apply_pitchbend(s, voice, v);
+				}
+				break;
+			default:
+				break;
+		}
+	} else {
+		switch(v->effect) {
+			case 0:
+				// 0xy: arpeggio; 000 is a genuine no-op (the common case).
+				if(v->effect_arg != 0) {
+					st_apply_arpeggio(s, voice, v, tick);
+				}
+				break;
+			case 1:
+				if(tick != 0) {
+					st_apply_slide(s, voice, v, -(int32_t)v->effect_arg);
+				}
+				break;
+			case 2:
+				if(tick != 0) {
+					st_apply_slide(s, voice, v, (int32_t)v->effect_arg);
+				}
+				break;
+			default:
+				break;
+		}
 	}
-#endif
 
 	// Post-UST extensions (universal in PT/NT/D.O.C./Master variants).
 	switch(v->effect) {
@@ -659,6 +727,11 @@ static struct soundtracker_state *soundtracker_init(void *data, uint32_t len, in
 		free(s);
 		return 0;
 	}
+#ifdef SOUNDTRACKER_VARIANT
+	s->variant = SOUNDTRACKER_VARIANT;
+#else
+	s->variant = st_detect_variant(s);
+#endif
 	paula_init(&s->paula, sample_rate, ST_TICK_HZ);
 	for(int32_t i = 0; i < ST_VOICES; ++i) {
 		s->voices[i].period_index = -1;

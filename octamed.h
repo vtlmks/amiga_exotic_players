@@ -1814,7 +1814,7 @@ static void octamed_play_paula_sample(struct octamed_state *s, int32_t idx, stru
 		paula_set_loop(&s->paula, idx, 0, 0);
 	}
 	if(off > 0) {
-		s->paula.ch[idx].pos_fp = off << PAULA_FP_SHIFT;
+		paula_set_pos(&s->paula, idx, off);
 	}
 }
 
@@ -2830,8 +2830,7 @@ static void octamed_handle_per_tick_fx(struct octamed_state *s, struct octamed_b
 			}
 			case 0x20: {
 				if(s->pulse_ctr == 0 && data != 0) {
-					uint32_t adv = (uint32_t)data_w << PAULA_FP_SHIFT;
-					s->paula.ch[trk].pos_fp += adv;
+					paula_set_pos(&s->paula, trk, s->paula.ch[trk].pos + (uint32_t)data_w);
 				}
 				break;
 			}
@@ -2862,7 +2861,7 @@ static void octamed_handle_per_tick_fx(struct octamed_state *s, struct octamed_b
 					// Mirrors C# !smp.IsSynthSound() check: skip on synth-only.
 					if(ci->valid && ci->sample_data && ci->synth == 0 && data < div) {
 						uint32_t pos = ((uint32_t)data * ci->sample_length) / div;
-						s->paula.ch[trk].pos_fp = pos << PAULA_FP_SHIFT;
+						paula_set_pos(&s->paula, trk, pos);
 					}
 				}
 				break;

@@ -257,8 +257,6 @@ static int32_t oktalyzer_load(struct oktalyzer_state *s, uint8_t *buf, uint32_t 
 	uint32_t pos = 8;
 	uint32_t read_patt = 0;
 	uint32_t read_samp = 0;
-	uint32_t pbod_seen = 0;
-	uint32_t sbod_seen = 0;
 
 	while(pos + 8 <= len) {
 		uint8_t *name = buf + pos;
@@ -305,7 +303,6 @@ static int32_t oktalyzer_load(struct oktalyzer_state *s, uint8_t *buf, uint32_t 
 			}
 			memcpy(s->pattern_table, cdata, 128);
 		} else if(memcmp(name, "PBOD", 4) == 0) {
-			pbod_seen++;
 			if((read_patt < s->patt_num) && (s->patterns != 0)) {
 				if(!oktalyzer_parse_pbod(s, read_patt, cdata, chunk_size)) {
 					return 0;
@@ -313,7 +310,6 @@ static int32_t oktalyzer_load(struct oktalyzer_state *s, uint8_t *buf, uint32_t 
 				read_patt++;
 			}
 		} else if(memcmp(name, "SBOD", 4) == 0) {
-			sbod_seen++;
 			if((read_samp < s->samp_num) && (s->samples != 0)) {
 				if(!oktalyzer_parse_sbod(s, &read_samp, cdata, chunk_size)) {
 					return 0;
