@@ -144,6 +144,21 @@ struct paula {
 	double led_z2_l;
 	double led_z1_r;
 	double led_z2_r;
+
+	// Decimation anti-alias low-pass: 8th-order Butterworth (4 cascaded RBJ
+	// biquads) at 0.45*host_rate, run in the Paula clock domain just before the
+	// rate drop. This is a resampler reconstruction filter, NOT modelled
+	// hardware: it bandlimits to below the host Nyquist so the box-average
+	// decimation cannot fold ultrasonic ZOH images down into the audible band.
+	// Keyed to host_rate, so it runs for both models; on the A500 the analog
+	// chain has already removed everything near Nyquist, making it a no-op.
+	double aa_b0[4];
+	double aa_a1[4];
+	double aa_a2[4];
+	double aa_z1_l[4];
+	double aa_z2_l[4];
+	double aa_z1_r[4];
+	double aa_z2_r[4];
 };
 
 // [=]===^=[ paula_recalc ]=======================================================================[=]
@@ -172,6 +187,21 @@ static void paula_recalc(struct paula *p) {
 	p->led_b2 = ((1.0 - cw) * 0.5) / a0;
 	p->led_a1 = (-2.0 * cw) / a0;
 	p->led_a2 = (1.0 - alpha) / a0;
+
+	// Decimation anti-alias: 8th-order Butterworth low-pass at 0.45*host_rate,
+	// mapped via RBJ bilinear at the Paula clock. The four sections carry the
+	// standard 8th-order Butterworth section Q's; cascaded DC gain is unity.
+	double aa_q[4] = {0.50979558, 0.60134489, 0.89997622, 2.56291545};
+	double aa_w0 = 2.0 * 3.14159265358979323846 * (0.45 * (double)p->sample_rate) / fs;
+	double aa_cw = cos(aa_w0);
+	double aa_sw = sin(aa_w0);
+	for(uint32_t st = 0; st < 4; ++st) {
+		double al = aa_sw / (2.0 * aa_q[st]);
+		double a0 = 1.0 + al;
+		p->aa_b0[st] = ((1.0 - aa_cw) * 0.5) / a0;
+		p->aa_a1[st] = (-2.0 * aa_cw) / a0;
+		p->aa_a2[st] = (1.0 - al) / a0;
+	}
 
 	// Box-filter decimation step: Paula clocks per host output sample, Q16.
 	p->decim_step = ((uint64_t)p->clock << PAULA_PERIOD_SHIFT) / (uint64_t)p->sample_rate;
@@ -359,7 +389,13 @@ static void paula_ch_advance(struct paula_channel *c) {
 		c->pos = np;
 	} else {
 		if(c->pos == 0 || (c->loop_length > 0 && c->pos <= c->loop_start)) {
-			if(c->loop_length > 0) {
+			if(c->has_pending) {
+				c->sample = c->pending_sample;
+				c->length = c->pending_length;
+				c->pos = c->pending_length - 1;
+				c->has_pending = 0;
+				c->pending_sample = 0;
+			} else if(c->loop_length > 0) {
 				c->pos = c->loop_start + c->loop_length - 1;
 			} else {
 				c->active = 0;
@@ -412,6 +448,13 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 	double lz2l = p->led_z2_l;
 	double lz1r = p->led_z1_r;
 	double lz2r = p->led_z2_r;
+	double ab0[4] = {p->aa_b0[0], p->aa_b0[1], p->aa_b0[2], p->aa_b0[3]};
+	double aa1[4] = {p->aa_a1[0], p->aa_a1[1], p->aa_a1[2], p->aa_a1[3]};
+	double aa2[4] = {p->aa_a2[0], p->aa_a2[1], p->aa_a2[2], p->aa_a2[3]};
+	double az1l[4] = {p->aa_z1_l[0], p->aa_z1_l[1], p->aa_z1_l[2], p->aa_z1_l[3]};
+	double az2l[4] = {p->aa_z2_l[0], p->aa_z2_l[1], p->aa_z2_l[2], p->aa_z2_l[3]};
+	double az1r[4] = {p->aa_z1_r[0], p->aa_z1_r[1], p->aa_z1_r[2], p->aa_z1_r[3]};
+	double az2r[4] = {p->aa_z2_r[0], p->aa_z2_r[1], p->aa_z2_r[2], p->aa_z2_r[3]};
 	uint64_t phase = p->decim_phase;
 	uint64_t dstep = p->decim_step;
 	// amp_gain normalises int8 full scale (128) to 1.0 and deliberately does
@@ -501,6 +544,19 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 			// saturation into the rails.
 			xl = paula_softclip(xl * amp_gain);
 			xr = paula_softclip(xr * amp_gain);
+			// Anti-alias before the rate drop: 4 cascaded Butterworth biquads
+			// (TDF-II), per stereo side. Bandlimits below host Nyquist so the
+			// box-average decimation below cannot fold ultrasonic images down.
+			for(uint32_t st = 0; st < 4; ++st) {
+				double yl = ab0[st] * xl + az1l[st];
+				az1l[st] = 2.0 * ab0[st] * xl - aa1[st] * yl + az2l[st];
+				az2l[st] = ab0[st] * xl - aa2[st] * yl;
+				xl = yl;
+				double yr = ab0[st] * xr + az1r[st];
+				az1r[st] = 2.0 * ab0[st] * xr - aa1[st] * yr + az2r[st];
+				az2r[st] = ab0[st] * xr - aa2[st] * yr;
+				xr = yr;
+			}
 			sl += xl;
 			sr += xr;
 		}
@@ -515,6 +571,12 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 	p->led_z2_l = lz2l;
 	p->led_z1_r = lz1r;
 	p->led_z2_r = lz2r;
+	for(uint32_t st = 0; st < 4; ++st) {
+		p->aa_z1_l[st] = az1l[st];
+		p->aa_z2_l[st] = az2l[st];
+		p->aa_z1_r[st] = az1r[st];
+		p->aa_z2_r[st] = az2r[st];
+	}
 	p->decim_phase = phase;
 
 #ifdef PAULA_PROFILE
