@@ -375,7 +375,8 @@ static void paula_mute(struct paula *p, int32_t idx) {
 // Consume one sample byte for a channel: step the read position one byte
 // (forward or backward), apply the pending-sample swap / loop wrap / one-shot
 // stop exactly as Paula DMA does, and re-latch the held byte.
-static void paula_ch_advance(struct paula_channel *c) {
+__attribute__((always_inline))
+static inline void paula_ch_advance(struct paula_channel *c) {
 	if(!c->backwards) {
 		uint32_t np = c->pos + 1;
 		if(np >= c->length) {
@@ -422,7 +423,10 @@ static void paula_ch_advance(struct paula_channel *c) {
 // deactivate a one-shot channel), then return the PWM-gated sample value the
 // channel contributes this clock. Returns 0.0 for a channel that is or just
 // went inactive, so the caller's accumulator can stay branch-free.
-static double paula_ch_sample(struct paula_channel *c) {
+// always_inline: called per Paula clock per active channel (~14M/s of audio),
+// and the inliner's -O2 size budget refuses on its own.
+__attribute__((always_inline))
+static inline double paula_ch_sample(struct paula_channel *c) {
 	if(!c->active) {
 		return 0.0;
 	}
