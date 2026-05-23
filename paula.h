@@ -10,11 +10,12 @@
 // hold staircase a real Paula produces). Volume is the real 6-bit PWM over a
 // 64-clock window, not a multiply, so its quantization noise is reproduced.
 // Channels 0+3 are summed to the left output, 1+2 to the right, hard-panned,
-// in the Paula clock domain. The A500 analog filter chain (fixed ~4.4 kHz RC
-// low-pass plus the switchable ~3.3 kHz LED Butterworth) runs at the Paula
-// clock rate. Only the final stage decimates to the host rate, by box-filter
-// integration of the Paula-clock samples that fall in each output window.
-// Aliasing and quantization noise that a real A500 produces are preserved.
+// in the Paula clock domain. The analog filter chain (always-on RC low-pass --
+// ~4.4 kHz on A500, ~34 kHz on A1200 -- plus the switchable ~3.3 kHz LED
+// Butterworth) runs at the Paula clock rate. Only the final stage decimates
+// to the host rate, by box-filter integration of the Paula-clock samples that
+// fall in each output window. Aliasing and quantization noise that a real
+// Amiga produces are preserved.
 //
 // Paula has exactly four hardware channels (0..3). There is no software-
 // mixer extension and no side bus: a real Amiga has no extra channel in its
@@ -102,9 +103,10 @@ struct paula_channel {
 	uint8_t backwards;         // 1 -> step DOWN through sample (DBP E3, etc.)
 };
 
-// Amiga model. Selects whether the fixed post-DAC RC low-pass is present. The
-// A500 has it (~4.4 kHz); the A1200's equivalent sits near ~34 kHz and is
-// effectively transparent, so it is not applied. The LED filter exists on
+// Amiga model. Selects the always-on post-DAC RC low-pass corner: ~4.4 kHz on
+// A500 (the classic muffled top end), ~34 kHz on A1200 (bright but not brick-
+// walled -- the slight roll into the top octave that real hardware has,
+// neither aliasing brightness nor A500 muffling). The LED filter exists on
 // both. Default is the A500.
 #define PAULA_MODEL_A500   0
 #define PAULA_MODEL_A1200  1
@@ -124,8 +126,8 @@ struct paula {
 	uint64_t decim_step;
 	uint64_t decim_phase;
 
-	// Fixed 1-pole RC low-pass (A500: ~4.4 kHz), at the Paula clock rate.
-	// Always on for the A500 model, bypassed for the A1200.
+	// Always-on 1-pole RC low-pass, at the Paula clock rate. Corner depends
+	// on model: ~4.4 kHz for A500, ~34 kHz for A1200.
 	double fixed_lp_a;
 	double fixed_lp_l;
 	double fixed_lp_r;
@@ -169,8 +171,10 @@ static void paula_recalc(struct paula *p) {
 	double fs = (double)p->clock;
 	double dt = 1.0 / fs;
 
-	// Fixed RC low-pass (A500), ~4.4 kHz. a = dt / (RC + dt).
-	double lp_rc = 1.0 / (2.0 * 3.14159265358979323846 * 4400.0);
+	// Always-on RC low-pass. Corner is model-dependent: A500 ~4.4 kHz,
+	// A1200 ~34 kHz. a = dt / (RC + dt).
+	double lp_fc = (p->model == PAULA_MODEL_A1200) ? 34000.0 : 4400.0;
+	double lp_rc = 1.0 / (2.0 * 3.14159265358979323846 * lp_fc);
 	p->fixed_lp_a = dt / (lp_rc + dt);
 
 	// LED filter: 2-pole Butterworth low-pass, ~3.3 kHz, Q = 1/sqrt(2),
@@ -227,10 +231,12 @@ static void paula_set_clock(struct paula *p, int32_t clock_hz) {
 }
 
 // [=]===^=[ paula_set_model ]====================================================================[=]
-// Select the emulated machine. Only the fixed post-DAC low-pass differs: the
-// A500 applies it (~4.4 kHz), the A1200 does not. Default is the A500.
+// Select the emulated machine. The always-on post-DAC RC low-pass corner
+// changes with model (A500 ~4.4 kHz, A1200 ~34 kHz); the LED filter exists on
+// both. Default is the A500.
 static void paula_set_model(struct paula *p, int32_t model) {
 	p->model = (model == PAULA_MODEL_A1200) ? PAULA_MODEL_A1200 : PAULA_MODEL_A500;
+	paula_recalc(p);
 }
 
 // [=]===^=[ paula_set_lp_filter ]================================================================[=]
@@ -279,11 +285,10 @@ static void paula_set_volume(struct paula *p, int32_t idx, uint16_t volume) {
 // Volume is passed in 0..256 range in NostalgicPlayer convention; divide to 0..64.
 // [=]===^=[ paula_set_volume_256 ]===============================================================[=]
 static void paula_set_volume_256(struct paula *p, int32_t idx, uint16_t volume) {
-	volume >>= 2;
-	if(volume > 64) {
-		volume = 64;
+	if(volume > 256) {
+		volume = 256;
 	}
-	p->ch[idx].volume = volume;
+	p->ch[idx].volume = volume >> 2;
 }
 
 // [=]===^=[ paula_play_sample ]==================================================================[=]
@@ -434,7 +439,6 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 	struct timespec prof_t0;
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &prof_t0);
 #endif
-	int32_t fixed = (p->model == PAULA_MODEL_A500);
 	int32_t led = p->lp_filter_on;
 	double fa = p->fixed_lp_a;
 	double fll = p->fixed_lp_l;
@@ -468,10 +472,12 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 
 	// Active-channel working set, built once per call. The selection
 	// predicate (active / unmuted / has sample / nonzero period) is stable
-	// within a mix call: only `active` can drop, when a one-shot sample ends
-	// mid-call, which the inner loop already detects per channel. Ascending
-	// order matches the 0..3 index sweep so each mix accumulator sees the
-	// same addition order and the output is bit-identical.
+	// within a mix call: only `active` can drop, when a one-shot sample
+	// ends mid-call, which the inner loop already detects per channel.
+	// Output is bit-identical because pl and pr are separate accumulators
+	// with fixed channel assignments (0+3 -> pl, 1+2 -> pr): the per-side
+	// sum only depends on which channels are active, not on hw[]'s
+	// iteration order.
 	uint32_t hw[PAULA_NUM_CHANNELS];
 	uint32_t nhw = 0;
 	for(int32_t ci = 0; ci < PAULA_NUM_CHANNELS; ++ci) {
@@ -524,12 +530,10 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 			// channel's full scale and the hardware path never clips.
 			double xl = pl * 0.5;
 			double xr = pr * 0.5;
-			if(fixed) {
-				fll += (xl - fll) * fa;
-				flr += (xr - flr) * fa;
-				xl = fll;
-				xr = flr;
-			}
+			fll += (xl - fll) * fa;
+			flr += (xr - flr) * fa;
+			xl = fll;
+			xr = flr;
 			if(led) {
 				double yl = lb0 * xl + lz1l;
 				lz1l = lb1 * xl - la1 * yl + lz2l;
@@ -547,6 +551,9 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 			// Anti-alias before the rate drop: 4 cascaded Butterworth biquads
 			// (TDF-II), per stereo side. Bandlimits below host Nyquist so the
 			// box-average decimation below cannot fold ultrasonic images down.
+			// RBJ low-pass identities baked in here: b1 = 2*b0 and b2 = b0,
+			// so only ab0[] is stored. Do not reuse this loop for a non-LP
+			// section -- it will silently produce wrong output.
 			for(uint32_t st = 0; st < 4; ++st) {
 				double yl = ab0[st] * xl + az1l[st];
 				az1l[st] = 2.0 * ab0[st] * xl - aa1[st] * yl + az2l[st];
