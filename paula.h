@@ -51,6 +51,13 @@
 #include <string.h>
 #include <math.h>
 
+// L+R packed double, used through the filter chain to halve biquad cost: all
+// three filter stages use identical coefficients per side, only state differs,
+// so each biquad line becomes one packed instruction (one packed FMA on
+// x86-64-v3). GCC/Clang vector extension; arithmetic operators are overloaded
+// to the right SIMD ops per -march.
+typedef double paula_v2df __attribute__((vector_size(16)));
+
 // Opt-in mixer profiler. Compiled in only when PAULA_PROFILE is defined, so
 // normal builds carry zero footprint. Accumulates process CPU time spent
 // strictly inside paula_mix_frames (not replayer tick work) and the number of
@@ -127,25 +134,22 @@ struct paula {
 	uint64_t decim_phase;
 
 	// Always-on 1-pole RC low-pass, at the Paula clock rate. Corner depends
-	// on model: ~4.4 kHz for A500, ~34 kHz for A1200.
+	// on model: ~4.4 kHz for A500, ~34 kHz for A1200. State is L+R packed.
 	double fixed_lp_a;
-	double fixed_lp_l;
-	double fixed_lp_r;
+	paula_v2df fixed_lp;
 
 	// Switchable LED filter: 2-pole Butterworth low-pass (~3.3 kHz,
 	// Q=1/sqrt(2)), at the Paula clock rate, RBJ bilinear coefficients.
 	// Driven by the replayer via paula_set_lp_filter; biquad state (TDF-II,
-	// per stereo side) persists across toggles so flips don't click.
+	// L+R packed) persists across toggles so flips don't click.
 	int32_t lp_filter_on;
 	double led_b0;
 	double led_b1;
 	double led_b2;
 	double led_a1;
 	double led_a2;
-	double led_z1_l;
-	double led_z2_l;
-	double led_z1_r;
-	double led_z2_r;
+	paula_v2df led_z1;
+	paula_v2df led_z2;
 
 	// Decimation anti-alias low-pass: 8th-order Butterworth (4 cascaded RBJ
 	// biquads) at 0.45*host_rate, run in the Paula clock domain just before the
@@ -154,13 +158,12 @@ struct paula {
 	// decimation cannot fold ultrasonic ZOH images down into the audible band.
 	// Keyed to host_rate, so it runs for both models; on the A500 the analog
 	// chain has already removed everything near Nyquist, making it a no-op.
+	// State is L+R packed per stage.
 	double aa_b0[4];
 	double aa_a1[4];
 	double aa_a2[4];
-	double aa_z1_l[4];
-	double aa_z2_l[4];
-	double aa_z1_r[4];
-	double aa_z2_r[4];
+	paula_v2df aa_z1[4];
+	paula_v2df aa_z2[4];
 };
 
 // [=]===^=[ paula_recalc ]=======================================================================[=]
@@ -413,6 +416,29 @@ static void paula_ch_advance(struct paula_channel *c) {
 	c->cur = c->sample[c->pos];
 }
 
+// [=]===^=[ paula_ch_sample ]====================================================================[=]
+// Consume one Paula clock for a single channel: bump the period accumulator,
+// advance the read position by as many bytes as the accumulator demands (may
+// deactivate a one-shot channel), then return the PWM-gated sample value the
+// channel contributes this clock. Returns 0.0 for a channel that is or just
+// went inactive, so the caller's accumulator can stay branch-free.
+static double paula_ch_sample(struct paula_channel *c) {
+	if(!c->active) {
+		return 0.0;
+	}
+	c->period_acc += PAULA_PERIOD_ONE;
+	while(c->period_acc >= c->period_q) {
+		c->period_acc -= c->period_q;
+		paula_ch_advance(c);
+		if(!c->active) {
+			return 0.0;
+		}
+	}
+	c->pwm_cnt = (uint8_t)((c->pwm_cnt + 1) & 63);
+	int32_t v = (c->pwm_cnt < c->volume) ? (int32_t)c->cur : 0;
+	return (double)v;
+}
+
 // [=]===^=[ paula_softclip ]=====================================================================[=]
 // Soft saturation of the A500 output buffer/amp into its supply rails. Unity
 // (identity) for |x| <= t so single-channel and typical multi-channel levels
@@ -434,33 +460,40 @@ static double paula_softclip(double x) {
 // Accumulates `frames` float stereo frames into `output`. Caller must
 // pre-clear. The inner loop runs at the Paula clock; each output frame is the
 // box-filter average of the Paula-clock samples in its window.
+//
+// L+R run packed as paula_v2df through the analog/AA chain: all three filter
+// stages share coefficients across sides, only state differs, so each biquad
+// line is one packed instruction (one packed FMA on x86-64-v3). Softclip is
+// the only extract/repack point (conditional + tanh, doesn't vectorise).
 static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 #ifdef PAULA_PROFILE
 	struct timespec prof_t0;
 	clock_gettime(CLOCK_PROCESS_CPUTIME_ID, &prof_t0);
 #endif
 	int32_t led = p->lp_filter_on;
-	double fa = p->fixed_lp_a;
-	double fll = p->fixed_lp_l;
-	double flr = p->fixed_lp_r;
-	double lb0 = p->led_b0;
-	double lb1 = p->led_b1;
-	double lb2 = p->led_b2;
-	double la1 = p->led_a1;
-	double la2 = p->led_a2;
-	double lz1l = p->led_z1_l;
-	double lz2l = p->led_z2_l;
-	double lz1r = p->led_z1_r;
-	double lz2r = p->led_z2_r;
-	double ab0[4] = {p->aa_b0[0], p->aa_b0[1], p->aa_b0[2], p->aa_b0[3]};
-	double aa1[4] = {p->aa_a1[0], p->aa_a1[1], p->aa_a1[2], p->aa_a1[3]};
-	double aa2[4] = {p->aa_a2[0], p->aa_a2[1], p->aa_a2[2], p->aa_a2[3]};
-	double az1l[4] = {p->aa_z1_l[0], p->aa_z1_l[1], p->aa_z1_l[2], p->aa_z1_l[3]};
-	double az2l[4] = {p->aa_z2_l[0], p->aa_z2_l[1], p->aa_z2_l[2], p->aa_z2_l[3]};
-	double az1r[4] = {p->aa_z1_r[0], p->aa_z1_r[1], p->aa_z1_r[2], p->aa_z1_r[3]};
-	double az2r[4] = {p->aa_z2_r[0], p->aa_z2_r[1], p->aa_z2_r[2], p->aa_z2_r[3]};
-	uint64_t phase = p->decim_phase;
-	uint64_t dstep = p->decim_step;
+	paula_v2df fa = {p->fixed_lp_a, p->fixed_lp_a};
+	paula_v2df fl = p->fixed_lp;
+	paula_v2df lb0 = {p->led_b0, p->led_b0};
+	paula_v2df lb1 = {p->led_b1, p->led_b1};
+	paula_v2df lb2 = {p->led_b2, p->led_b2};
+	paula_v2df la1 = {p->led_a1, p->led_a1};
+	paula_v2df la2 = {p->led_a2, p->led_a2};
+	paula_v2df lz1 = p->led_z1;
+	paula_v2df lz2 = p->led_z2;
+	paula_v2df ab0[4];
+	paula_v2df aa1[4];
+	paula_v2df aa2[4];
+	paula_v2df az1[4];
+	paula_v2df az2[4];
+	for(uint32_t st = 0; st < 4; ++st) {
+		ab0[st] = (paula_v2df){p->aa_b0[st], p->aa_b0[st]};
+		aa1[st] = (paula_v2df){p->aa_a1[st], p->aa_a1[st]};
+		aa2[st] = (paula_v2df){p->aa_a2[st], p->aa_a2[st]};
+		az1[st] = p->aa_z1[st];
+		az2[st] = p->aa_z2[st];
+	}
+	paula_v2df two  = {2.0, 2.0};
+	paula_v2df half = {0.5, 0.5};
 	// amp_gain normalises int8 full scale (128) to 1.0 and deliberately does
 	// NOT make up the resistive divider's 6 dB: a single full-scale channel
 	// lands at ~0.5 (linear, clear of the 0.8 soft knee) and two correlated
@@ -468,24 +501,33 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 	// saturator only engages on genuinely hot correlated content the way a
 	// real A500 does -- not on ordinary single/normal-level material. Output
 	// is the box-filter average over the window (/n).
-	const double amp_gain = 1.0 / 128.0;
+	paula_v2df amp = {1.0 / 128.0, 1.0 / 128.0};
+	uint64_t phase = p->decim_phase;
+	uint64_t dstep = p->decim_step;
 
-	// Active-channel working set, built once per call. The selection
-	// predicate (active / unmuted / has sample / nonzero period) is stable
-	// within a mix call: only `active` can drop, when a one-shot sample
-	// ends mid-call, which the inner loop already detects per channel.
-	// Output is bit-identical because pl and pr are separate accumulators
-	// with fixed channel assignments (0+3 -> pl, 1+2 -> pr): the per-side
-	// sum only depends on which channels are active, not on hw[]'s
-	// iteration order.
-	uint32_t hw[PAULA_NUM_CHANNELS];
-	uint32_t nhw = 0;
+	// Active-channel working set, split by side. The selection predicate
+	// (active / unmuted / has sample / nonzero period) is stable within a
+	// mix call: only `active` can drop when a one-shot sample ends mid-call,
+	// which paula_ch_sample handles per channel. Splitting by side kills the
+	// per-Paula-clock "ci == 0 || ci == 3" branch -- each per-side scalar
+	// accumulator now stays in a register through its sweep. Output is bit-
+	// identical because pl and pr are separate accumulators with fixed
+	// channel assignments (0+3 -> pl, 1+2 -> pr): the per-side sum only
+	// depends on which channels are active, not on iteration order.
+	struct paula_channel *hw_l[PAULA_NUM_CHANNELS];
+	struct paula_channel *hw_r[PAULA_NUM_CHANNELS];
+	uint32_t nl = 0;
+	uint32_t nr = 0;
 	for(int32_t ci = 0; ci < PAULA_NUM_CHANNELS; ++ci) {
 		struct paula_channel *c = &p->ch[ci];
 		if(!c->active || c->muted || c->sample == 0 || c->period_q == 0) {
 			continue;
 		}
-		hw[nhw++] = (uint32_t)ci;
+		if(ci == 0 || ci == 3) {
+			hw_l[nl++] = c;
+		} else {
+			hw_r[nr++] = c;
+		}
 	}
 
 	for(int32_t i = 0; i < frames; ++i) {
@@ -495,94 +537,59 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 		if(n == 0) {
 			n = 1;
 		}
-		double sl = 0.0;
-		double sr = 0.0;
+		paula_v2df s = {0.0, 0.0};
 		for(uint32_t k = 0; k < n; ++k) {
 			double pl = 0.0;
 			double pr = 0.0;
-			for(uint32_t j = 0; j < nhw; ++j) {
-				uint32_t ci = hw[j];
-				struct paula_channel *c = &p->ch[ci];
-				if(!c->active) {
-					continue;
-				}
-				c->period_acc += PAULA_PERIOD_ONE;
-				while(c->period_acc >= c->period_q) {
-					c->period_acc -= c->period_q;
-					paula_ch_advance(c);
-					if(!c->active) {
-						break;
-					}
-				}
-				if(!c->active) {
-					continue;
-				}
-				c->pwm_cnt = (uint8_t)((c->pwm_cnt + 1) & 63);
-				int32_t s = (c->pwm_cnt < c->volume) ? (int32_t)c->cur : 0;
-				if(ci == 0 || ci == 3) {
-					pl += (double)s;
-				} else {
-					pr += (double)s;
-				}
+			for(uint32_t j = 0; j < nl; ++j) {
+				pl += paula_ch_sample(hw_l[j]);
 			}
-			// Passive resistive averaging summer: the per-side filter
-			// node is (ch_a + ch_b) / 2, so it cannot exceed a single
-			// channel's full scale and the hardware path never clips.
-			double xl = pl * 0.5;
-			double xr = pr * 0.5;
-			fll += (xl - fll) * fa;
-			flr += (xr - flr) * fa;
-			xl = fll;
-			xr = flr;
+			for(uint32_t j = 0; j < nr; ++j) {
+				pr += paula_ch_sample(hw_r[j]);
+			}
+			// Passive resistive averaging summer: the per-side filter node
+			// is (ch_a + ch_b) / 2, so it cannot exceed a single channel's
+			// full scale and the hardware path never clips.
+			paula_v2df x = (paula_v2df){pl, pr} * half;
+			// Always-on RC pole (model-dependent corner baked into fa).
+			fl = fl + (x - fl) * fa;
+			x = fl;
 			if(led) {
-				double yl = lb0 * xl + lz1l;
-				lz1l = lb1 * xl - la1 * yl + lz2l;
-				lz2l = lb2 * xl - la2 * yl;
-				double yr = lb0 * xr + lz1r;
-				lz1r = lb1 * xr - la1 * yr + lz2r;
-				lz2r = lb2 * xr - la2 * yr;
-				xl = yl;
-				xr = yr;
+				paula_v2df y = lb0 * x + lz1;
+				lz1 = lb1 * x - la1 * y + lz2;
+				lz2 = lb2 * x - la2 * y;
+				x = y;
 			}
 			// Downstream output buffer/amp: gain compensation then soft
-			// saturation into the rails.
-			xl = paula_softclip(xl * amp_gain);
-			xr = paula_softclip(xr * amp_gain);
+			// saturation into the rails. Softclip is the only scalar point.
+			x = x * amp;
+			x = (paula_v2df){paula_softclip(x[0]), paula_softclip(x[1])};
 			// Anti-alias before the rate drop: 4 cascaded Butterworth biquads
-			// (TDF-II), per stereo side. Bandlimits below host Nyquist so the
-			// box-average decimation below cannot fold ultrasonic images down.
+			// (TDF-II), L+R packed. Bandlimits below host Nyquist so the box-
+			// average decimation below cannot fold ultrasonic images down.
 			// RBJ low-pass identities baked in here: b1 = 2*b0 and b2 = b0,
 			// so only ab0[] is stored. Do not reuse this loop for a non-LP
 			// section -- it will silently produce wrong output.
 			for(uint32_t st = 0; st < 4; ++st) {
-				double yl = ab0[st] * xl + az1l[st];
-				az1l[st] = 2.0 * ab0[st] * xl - aa1[st] * yl + az2l[st];
-				az2l[st] = ab0[st] * xl - aa2[st] * yl;
-				xl = yl;
-				double yr = ab0[st] * xr + az1r[st];
-				az1r[st] = 2.0 * ab0[st] * xr - aa1[st] * yr + az2r[st];
-				az2r[st] = ab0[st] * xr - aa2[st] * yr;
-				xr = yr;
+				paula_v2df y = ab0[st] * x + az1[st];
+				az1[st] = two * ab0[st] * x - aa1[st] * y + az2[st];
+				az2[st] = ab0[st] * x - aa2[st] * y;
+				x = y;
 			}
-			sl += xl;
-			sr += xr;
+			s = s + x;
 		}
 		double inv = 1.0 / (double)n;
-		output[2 * i]     += (float)(sl * inv);
-		output[2 * i + 1] += (float)(sr * inv);
+		paula_v2df out = s * (paula_v2df){inv, inv};
+		output[2 * i]     += (float)out[0];
+		output[2 * i + 1] += (float)out[1];
 	}
 
-	p->fixed_lp_l = fll;
-	p->fixed_lp_r = flr;
-	p->led_z1_l = lz1l;
-	p->led_z2_l = lz2l;
-	p->led_z1_r = lz1r;
-	p->led_z2_r = lz2r;
+	p->fixed_lp = fl;
+	p->led_z1 = lz1;
+	p->led_z2 = lz2;
 	for(uint32_t st = 0; st < 4; ++st) {
-		p->aa_z1_l[st] = az1l[st];
-		p->aa_z2_l[st] = az2l[st];
-		p->aa_z1_r[st] = az1r[st];
-		p->aa_z2_r[st] = az2r[st];
+		p->aa_z1[st] = az1[st];
+		p->aa_z2[st] = az2[st];
 	}
 	p->decim_phase = phase;
 
