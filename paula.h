@@ -30,8 +30,9 @@
 //   1. Resistive averaging summer: the two channels on each side (0+3 left,
 //      1+2 right) join through equal board resistors, so the per-side node
 //      is (ch_a + ch_b) / 2 (a ~6 dB attenuation).
-//   2. The A500 analog filter chain (fixed ~4.4 kHz RC, switchable ~3.3 kHz
-//      LED Butterworth) acts on that node.
+//   2. The analog filter chain acts on that node: an always-on RC low-pass
+//      (~4.4 kHz on A500, ~34 kHz on A1200) plus the switchable ~3.3 kHz
+//      LED Butterworth.
 //   3. Output buffer/amp: normalises int8 full scale to unity (no make-up
 //      gain over the resistive divider), then soft saturation into the
 //      supply rails. The divider is left uncompensated on purpose: it puts
@@ -245,7 +246,8 @@ static void paula_set_model(struct paula *p, int32_t model) {
 // [=]===^=[ paula_set_lp_filter ]================================================================[=]
 // Enable or disable the switchable Amiga LED filter (the power-LED-gated
 // 2-pole low-pass). Replayers call this to mirror the module's own filter
-// state. The fixed RC low-pass is not affected and always runs (A500).
+// state. The always-on RC low-pass is not affected (A500 ~4.4 kHz, A1200
+// ~34 kHz).
 static void paula_set_lp_filter(struct paula *p, int32_t on) {
 	p->lp_filter_on = on ? 1 : 0;
 }
