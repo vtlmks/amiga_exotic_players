@@ -33,18 +33,35 @@
 //   2. The analog filter chain acts on that node: an always-on RC low-pass
 //      (~4.4 kHz on A500, ~34 kHz on A1200) plus the switchable ~3.3 kHz
 //      LED Butterworth.
-//   3. Output buffer/amp: normalises int8 full scale to unity (no make-up
-//      gain over the resistive divider), then soft saturation into the
-//      supply rails. The divider is left uncompensated on purpose: it puts
-//      a single full-scale channel at ~0.5 (well clear of the 0.8 knee,
-//      fully linear) and two correlated full-scale channels on the same
-//      side at ~1.0 (just into the knee). So the saturator engages only on
-//      genuinely hot correlated multi-channel content -- as a real A500
-//      measurably does -- not on ordinary single/normal-level material.
-//      It is a soft knee, not a hard clip (which would synthesise harmonics
-//      the machine never produces) and not clip-free. Absolute level is the
-//      host's concern; this trades ~6 dB of headroom for a faithful
-//      saturation onset.
+//   3. Output buffer/amp: normalises int8 full scale to unity. The
+//      resistive divider's ~6 dB attenuation is preserved (not compensated)
+//      so the per-side level matches real hardware: a single full-scale
+//      channel lands at ~0.5, two correlated full-scale channels on the
+//      same side at ~1.0. No analog rail saturation is modelled -- at line
+//      out on a stock A500 the output op-amp runs with ~10 V of usable
+//      rail headroom against a ~1 V peak signal and never reaches its
+//      rails in practice. The output is then clamped to [-1, +1] purely
+//      as a digital safety guard for callers converting to fixed-point:
+//      small Butterworth step overshoot on transients (a few percent)
+//      cannot leak out as wrap/click noise after a (int16_t)(x * 32768)
+//      style cast. Absolute level is the host's concern.
+//
+// Host integration: the filter chain (always-on RC LP + switchable LED
+// Butterworth + decimation anti-alias) runs IIR state at the Paula clock,
+// and that state decays exponentially toward zero when channels go silent.
+// Once any state slot crosses the float denormal threshold (~1.18e-38),
+// every subsequent multiply touching it is denormal-slow on x86 (roughly
+// two orders of magnitude); a single mix can blow past the host's audio
+// buffer duration -- audible as underrun. Adding per-sample denormal-
+// prevention bias inside the filter inner loops would cost a fadd per
+// stage per Paula clock (millions/sec), so the agreed convention is:
+// THE HOST AUDIO THREAD MUST RUN WITH MXCSR FTZ+DAZ ENABLED. Any thread
+// that calls paula_mix_frames is in scope. The standard recipe is
+//   #include <pmmintrin.h>
+//   _MM_SET_FLUSH_ZERO_MODE(_MM_FLUSH_ZERO_ON);
+//   _MM_SET_DENORMALS_ZERO_MODE(_MM_DENORMALS_ZERO_ON);
+// at the top of the audio thread proc. MXCSR is per-thread on x86 so this
+// must be set inside the thread, not once at program start.
 
 #pragma once
 
@@ -445,23 +462,6 @@ static inline double paula_ch_sample(struct paula_channel *c) {
 	return (double)v;
 }
 
-// [=]===^=[ paula_softclip ]=====================================================================[=]
-// Soft saturation of the A500 output buffer/amp into its supply rails. Unity
-// (identity) for |x| <= t so single-channel and typical multi-channel levels
-// are unaffected; above t it bends smoothly (C1-continuous, slope 1 at the
-// knee) and asymptotes to +/-1. Aggressive correlated multi-channel content
-// is compressed into the rails the way a real A500 does -- not a hard clip,
-// which would synthesise harmonics the machine never produces.
-static double paula_softclip(double x) {
-	double t = 0.8;
-	double a = (x < 0.0) ? -x : x;
-	if(a <= t) {
-		return x;
-	}
-	double s = (x < 0.0) ? -1.0 : 1.0;
-	return s * (t + (1.0 - t) * tanh((a - t) / (1.0 - t)));
-}
-
 // [=]===^=[ paula_mix_frames ]===================================================================[=]
 // Accumulates `frames` float stereo frames into `output`. Caller must
 // pre-clear. The inner loop runs at the Paula clock; each output frame is the
@@ -469,8 +469,9 @@ static double paula_softclip(double x) {
 //
 // L+R run packed as paula_v2df through the analog/AA chain: all three filter
 // stages share coefficients across sides, only state differs, so each biquad
-// line is one packed instruction (one packed FMA on x86-64-v3). Softclip is
-// the only extract/repack point (conditional + tanh, doesn't vectorise).
+// line is one packed instruction (one packed FMA on x86-64-v3). The output
+// safety clamp at the box-average store is also packed (one minpd, one
+// maxpd).
 static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 #ifdef PAULA_PROFILE
 	struct timespec prof_t0;
@@ -501,12 +502,11 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 	paula_v2df two  = {2.0, 2.0};
 	paula_v2df half = {0.5, 0.5};
 	// amp_gain normalises int8 full scale (128) to 1.0 and deliberately does
-	// NOT make up the resistive divider's 6 dB: a single full-scale channel
-	// lands at ~0.5 (linear, clear of the 0.8 soft knee) and two correlated
-	// full-scale channels on a side at ~1.0 (just into the knee), so the
-	// saturator only engages on genuinely hot correlated content the way a
-	// real A500 does -- not on ordinary single/normal-level material. Output
-	// is the box-filter average over the window (/n).
+	// NOT make up the resistive divider's 6 dB attenuation -- the per-side
+	// level then matches real hardware (single full-scale channel at ~0.5,
+	// two correlated full-scale channels on a side at ~1.0). Output is the
+	// box-filter average over the window (/n), clamped to [-1, +1] at the
+	// float store as a digital safety guard for fixed-point conversion.
 	paula_v2df amp = {1.0 / 128.0, 1.0 / 128.0};
 	uint64_t phase = p->decim_phase;
 	uint64_t dstep = p->decim_step;
@@ -566,10 +566,9 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 				lz2 = lb2 * x - la2 * y;
 				x = y;
 			}
-			// Downstream output buffer/amp: gain compensation then soft
-			// saturation into the rails. Softclip is the only scalar point.
+			// Downstream output buffer/amp: int8 -> unity normalisation.
+			// No rail saturation is modelled (see header for rationale).
 			x = x * amp;
-			x = (paula_v2df){paula_softclip(x[0]), paula_softclip(x[1])};
 			// Anti-alias before the rate drop: 4 cascaded Butterworth biquads
 			// (TDF-II), L+R packed. Bandlimits below host Nyquist so the box-
 			// average decimation below cannot fold ultrasonic images down.
@@ -584,8 +583,16 @@ static void paula_mix_frames(struct paula *p, float *output, int32_t frames) {
 			}
 			s = s + x;
 		}
+		// Box-filter average over the window, then clamp to [-1, +1] as a
+		// digital safety guard so callers casting to fixed-point cannot get
+		// wrap/click from small Butterworth transient overshoot. Branchless
+		// packed -- one minpd, one maxpd via the GCC vector built-ins.
 		double inv = 1.0 / (double)n;
 		paula_v2df out = s * (paula_v2df){inv, inv};
+		paula_v2df hi = {1.0, 1.0};
+		paula_v2df lo = {-1.0, -1.0};
+		out = __builtin_ia32_minpd(out, hi);
+		out = __builtin_ia32_maxpd(out, lo);
 		output[2 * i]     += (float)out[0];
 		output[2 * i + 1] += (float)out[1];
 	}
